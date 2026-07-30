@@ -31,7 +31,6 @@ const OVERVIEW_VERBS: &[&str] = &[
 // Generous enough to cover most real READMEs whole (Orbit's own is ~5.8
 // KB) while still being a hard bound, not "read the whole file".
 const OVERVIEW_READ_BYTES: u64 = 12_000;
-const OVERVIEW_SEARCH_LIMIT: usize = 5;
 const MAX_OVERVIEW_READS: usize = 2;
 
 /// Matches "What does this repository do?", "Explain this project.",
@@ -42,12 +41,24 @@ pub fn is_broad_overview_question(question: &str) -> bool {
     OVERVIEW_SUBJECTS.iter().any(|s| q.contains(s)) && OVERVIEW_VERBS.iter().any(|v| q.contains(v))
 }
 
-/// Deterministically call `project.information`, then `project.search` for
-/// the project's own name, then `project.read_file` on whichever
-/// overview-shaped docs actually exist -- all *before* the model ever sees
-/// the question. This is the fix for a small local model unreliably
-/// deciding, on its own, to call the right tools in the right order for a
-/// vague question: grounding no longer depends on that decision.
+/// Deterministically call `project.information`, then `project.read_file`
+/// on whichever overview-shaped docs actually exist -- all *before* the
+/// model ever sees the question. This is the fix for a small local model
+/// unreliably deciding, on its own, to call the right tools in the right
+/// order for a vague question: grounding no longer depends on that
+/// decision.
+///
+/// An earlier version of this also ran `project.search` for the project's
+/// own name as a broad third step. It was dropped: a bare project name is
+/// often a generic word (a real project here is literally named
+/// `assistant`), so that search matched incidental substrings in unrelated
+/// files -- `Cargo.toml`'s `repository = ".../assistant"` line, for
+/// example -- and those matches became noisy, irrelevant entries in the
+/// final answer's sources. `project.read_file` on ranked overview docs is
+/// precise by construction (it only reads files that look like READMEs,
+/// instructions, or specs); a bare keyword search on the project's own
+/// name is not, so keeping only the precise step is a deliberate
+/// application-code decision, not something left to the model to avoid.
 ///
 /// Every call goes through the exact same `ActionRegistry::execute` a
 /// model-initiated call would: identical permission enforcement, identical
@@ -77,22 +88,6 @@ pub async fn run(
         &mut next_call_id,
     )
     .await;
-
-    let project_name = context.config.project.name.trim().to_string();
-    if !project_name.is_empty() {
-        execute_synthetic(
-            registry,
-            context,
-            confirmation,
-            history,
-            "project.search",
-            json!({ "query": project_name, "limit": OVERVIEW_SEARCH_LIMIT }),
-            &mut sources,
-            &mut records,
-            &mut next_call_id,
-        )
-        .await;
-    }
 
     for path in overview_candidates(registry, context, confirmation).await {
         execute_synthetic(

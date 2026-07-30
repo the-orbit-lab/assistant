@@ -19,9 +19,10 @@ async fn main() -> std::process::ExitCode {
         Err(err) => {
             eprintln!("Error: {err}");
             match err {
-                OrbitError::ConfigNotFound { .. } | OrbitError::AmbiguousProjectRoot { .. } => {
-                    std::process::ExitCode::from(2)
-                }
+                OrbitError::ConfigNotFound { .. }
+                | OrbitError::AmbiguousProjectRoot { .. }
+                | OrbitError::WorkspaceNotFound { .. }
+                | OrbitError::NoActiveProject { .. } => std::process::ExitCode::from(2),
                 _ => std::process::ExitCode::FAILURE,
             }
         }
@@ -68,5 +69,7 @@ async fn dispatch(cli: Cli) -> Result<(), OrbitError> {
         Command::Doctor => commands::doctor::run(&cli.global).await,
         Command::Chat => commands::chat::run(&cli.global).await,
         Command::Mcp(McpCommand::Serve) => commands::mcp_serve::run(&cli.global).await,
+        Command::Workspace(args) => commands::workspace::run(&cli.global, args).await,
+        Command::Projects => commands::projects::run(&cli.global).await,
     }
 }

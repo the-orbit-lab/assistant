@@ -1,11 +1,15 @@
+use std::path::PathBuf;
+
 use orbit_core::OrbitError;
 use orbit_project::config::starter_yaml;
 
 use crate::args::{GlobalArgs, InitArgs};
 
 pub fn run(global: &GlobalArgs, args: InitArgs) -> Result<(), OrbitError> {
+    // `orbit init` always treats --project as a filesystem path: there is
+    // no workspace yet for a bare name to resolve against.
     let target_dir = match &global.project {
-        Some(dir) => dir.clone(),
+        Some(dir) => PathBuf::from(dir),
         None => std::env::current_dir().map_err(|e| OrbitError::io(".", e))?,
     };
     let orbit_dir = target_dir.join(".orbit");

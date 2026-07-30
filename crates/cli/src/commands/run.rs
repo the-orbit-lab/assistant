@@ -5,11 +5,14 @@ use serde_json::json;
 use crate::args::{GlobalArgs, RunArgs};
 use crate::confirm::build_confirmation_provider;
 use crate::output::print_json;
-use crate::resolve::resolve_project;
+use crate::resolve::resolve_project_with_mode;
 use crate::runtime::build_context;
 
 pub async fn run(global: &GlobalArgs, args: RunArgs) -> Result<(), OrbitError> {
-    let loaded = resolve_project(global)?;
+    // Commands never fall back to a workspace's default project: at a
+    // workspace root with no explicit --project, this must ask for one
+    // rather than silently running somewhere the caller didn't choose.
+    let loaded = resolve_project_with_mode(global, true)?;
     let ctx = build_context(loaded);
     let registry = orbit_actions::native_registry()?;
     let confirmation = build_confirmation_provider(global.yes);

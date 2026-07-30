@@ -17,10 +17,16 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 pub struct GlobalArgs {
-    /// Use this project directory instead of searching upward from the
-    /// current directory.
+    /// A filesystem path, or (when a workspace is active) a registered
+    /// project name or alias. A value starting with `./`, `../`, `/`, or a
+    /// platform path prefix is always treated as a path.
     #[arg(long, global = true)]
-    pub project: Option<PathBuf>,
+    pub project: Option<String>,
+
+    /// Use this workspace directory instead of searching upward from the
+    /// current directory for `.orbit/workspace.yaml`.
+    #[arg(long, global = true)]
+    pub workspace: Option<PathBuf>,
 
     /// Use this exact `project.yaml` path instead of the usual
     /// `<root>/.orbit/project.yaml` layout.
@@ -77,12 +83,44 @@ pub enum Command {
     /// MCP server/client operations.
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Show workspace information, or `orbit workspace init` to create one.
+    Workspace(WorkspaceArgs),
+    /// List every project registered in the active workspace.
+    Projects,
 }
 
 #[derive(Subcommand)]
 pub enum McpCommand {
-    /// Serve this project's exposed actions over MCP stdio.
+    /// Serve this project's (or, with --workspace, workspace's) exposed
+    /// actions over MCP stdio.
     Serve,
+}
+
+#[derive(Args)]
+pub struct WorkspaceArgs {
+    #[command(subcommand)]
+    pub action: Option<WorkspaceAction>,
+}
+
+#[derive(Subcommand)]
+pub enum WorkspaceAction {
+    /// Create `.orbit/workspace.yaml`, registering immediate child
+    /// directories that already contain `.orbit/project.yaml`.
+    Init(WorkspaceInitArgs),
+}
+
+#[derive(Args)]
+pub struct WorkspaceInitArgs {
+    /// Overwrite an existing `.orbit/workspace.yaml`.
+    #[arg(long)]
+    pub force: bool,
+    /// Workspace name written into the generated configuration. Defaults
+    /// to the target directory's name.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Workspace description written into the generated configuration.
+    #[arg(long, default_value = "")]
+    pub description: String,
 }
 
 #[derive(Args)]
@@ -107,11 +145,21 @@ pub struct SearchArgs {
     pub query: String,
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
+    /// Search these registered projects instead of the current
+    /// single-project context. Comma-separated registered names or
+    /// aliases, e.g. `--projects docs,obc`.
+    #[arg(long, value_delimiter = ',')]
+    pub projects: Vec<String>,
 }
 
 #[derive(Args)]
 pub struct AskArgs {
     pub question: String,
+    /// Ask across these registered projects instead of the current
+    /// single-project context, or instead of scanning the question text
+    /// for project names. Comma-separated registered names or aliases.
+    #[arg(long, value_delimiter = ',')]
+    pub projects: Vec<String>,
 }
 
 #[derive(Args)]

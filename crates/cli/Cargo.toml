@@ -16,6 +16,7 @@ orbit-actions = { workspace = true }
 orbit-providers = { workspace = true }
 orbit-agent = { workspace = true }
 orbit-mcp-server = { workspace = true }
+orbit-workspace = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-std"] }

@@ -6,5 +6,8 @@ pub mod init;
 pub mod list_commands;
 pub mod mcp_serve;
 pub mod project;
+pub mod projects;
 pub mod run;
 pub mod search;
+pub mod workspace;
+pub mod workspace_init;

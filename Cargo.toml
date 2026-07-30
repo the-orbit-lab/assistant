@@ -1,8 +1,40 @@
-[package]
-name = "orbit-assistant"
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/orbit-lab/assistant"
 
-[[bin]]
-name = "orbit"
-path = "src/main.rs"
+[workspace.dependencies]
+orbit-core = { path = "crates/core" }
+orbit-project = { path = "crates/project" }
+orbit-actions = { path = "crates/actions" }
+orbit-providers = { path = "crates/providers" }
+orbit-agent = { path = "crates/agent" }
+orbit-mcp-client = { path = "crates/mcp-client" }
+orbit-mcp-server = { path = "crates/mcp-server" }
+
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+serde_norway = "0.9"
+thiserror = "2"
+tokio = { version = "1" }
+reqwest = { version = "0.13", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+walkdir = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rmcp = "3"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true

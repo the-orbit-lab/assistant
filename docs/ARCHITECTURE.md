@@ -94,6 +94,23 @@ validation, then permission enforcement (`allow`/`ask`/`deny`), then
 execution, then an `ExecutionRecord`. The model can request an action; it
 can never grant itself permission to run one.
 
+### Deterministic retrieval for broad questions
+
+A small local model does not reliably decide, on its own, to call the
+right tools for a vague question like "What does this repository do?" —
+there is no keyword in the question itself to search for. For questions
+matching that shape, `orbit-agent::retrieval` runs
+`project.information` → `project.search` (for the project's own name) →
+`project.read_file` (on whichever overview-shaped docs actually exist —
+README, CLAUDE.md, a spec under `docs/`, ranked by an adaptive heuristic
+over the real file list) *before* the model's first turn, through the
+exact same `ActionRegistry::execute` a model-initiated call would use —
+same permission enforcement, same execution records. The model still
+sees these as ordinary tool-call/tool-result messages; it just doesn't
+have to have decided to make them. Everything else (a specific question
+like "why was the ESP32-C3 selected?") is left entirely to the model's
+own tool-calling.
+
 ## MCP: both directions
 
 - **Server** (`orbit mcp serve`): wraps `ActionRegistry` behind the MCP

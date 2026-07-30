@@ -1,175 +1,93 @@
-# Orbit Engineer — Project Specification
+Read `CLAUDE.md`, `README.md`, and the complete `docs/PROJECT_SPEC.md` before making any changes.
 
-## 1. Project Overview
+Your task is to build the first functional version of Orbit from the ground up.
 
-Orbit Engineer is a personal AI engineering assistant designed to understand, inspect, and assist with real engineering projects.
+Orbit is not a simple chatbot wrapper. It is a configurable AI engineering assistant that must understand the current project, inspect allowed files, search documentation and source code, use tools, enforce permissions, communicate with a language model provider, and return answers grounded in project sources.
 
-The project is inspired by fictional assistants such as JARVIS, but its goal is not to simulate a general artificial intelligence. Its purpose is to provide a practical engineering workspace capable of understanding project documentation, source code, calculations, logs, tests, requirements, and technical decisions.
+Do not only create placeholders, empty modules, interfaces without implementations, or a large architecture that does not run. Produce a usable end-to-end version.
 
-Orbit Engineer must be able to operate across different repositories while adapting its behavior to the configuration of each project.
+## Main goal
 
-The assistant will initially be used inside the Orbit Lab ecosystem, but the architecture should remain generic enough to support unrelated engineering and software projects in the future.
-
-The project must be developed incrementally. The first version is a command-line assistant. Voice interaction, desktop applications, persistent memory, and advanced automation will be added only after the core architecture is stable.
-
----
-
-## 2. Repository Name
-
-Repository:
-
-```text
-assistant
-```
-
-Suggested description:
-
-```text
-A configurable AI engineering assistant for project documentation, code, calculations, tests, and technical workflows.
-```
-
----
-
-## 3. Core Principle
-
-Orbit Engineer must not be implemented as a simple chatbot wrapper.
-
-The language model is responsible for interpreting requests, selecting tools, organizing information, and explaining results.
-
-Reliable engineering operations must be implemented as deterministic tools.
-
-For example, the language model must not independently calculate orbital parameters when a validated Rust function is available. Instead, it should call the appropriate tool and explain the returned result.
-
-The project should follow this separation:
-
-```text
-User request
-    ↓
-Agent interprets the request
-    ↓
-Agent selects a tool
-    ↓
-Deterministic code performs the operation
-    ↓
-Agent explains the result with sources and assumptions
-```
-
----
-
-## 4. Initial Scope
-
-The first version must provide a CLI capable of:
-
-* loading a project configuration;
-* understanding the current repository;
-* reading allowed project files;
-* searching Markdown documentation;
-* answering questions based on project sources;
-* showing which files were used in an answer;
-* executing explicitly configured commands;
-* running build, test, lint, and formatting commands;
-* reading command output;
-* reporting errors in an understandable way;
-* supporting at least one language model provider;
-* maintaining a conversation during the current session;
-* enforcing project permissions.
-
-The first version does not need:
-
-* voice recognition;
-* text-to-speech;
-* a desktop application;
-* mobile support;
-* autonomous long-running tasks;
-* unrestricted terminal access;
-* automatic commits or pushes;
-* vector databases;
-* multiple MCP servers;
-* control of physical hardware;
-* permanent personal memory.
-
-These features may be introduced later.
-
----
-
-## 5. Example Usage
+After your work, the following flow must work:
 
 ```bash
 orbit init
-```
-
-Creates an initial configuration file for the current repository.
-
-```bash
 orbit ask "What does this project do?"
 ```
 
-Answers using the repository documentation.
+`orbit init` must create a valid `.orbit/project.yaml`.
+
+`orbit ask` must:
+
+1. locate the project root;
+2. load and validate `.orbit/project.yaml`;
+3. discover allowed project files;
+4. respect include and exclude rules;
+5. search for relevant context;
+6. send the selected context to a configured language model;
+7. return a useful answer;
+8. display the source files used;
+9. never access excluded or unsafe paths.
+
+Also implement:
 
 ```bash
-orbit ask "Why was the ESP32-C3 selected?"
-```
-
-Searches project documentation and returns the relevant decision with its source.
-
-```bash
-orbit test
-```
-
-Runs the configured test command.
-
-```bash
+orbit project
+orbit files
+orbit search "query"
 orbit check
 ```
 
-Runs the configured build, test, lint, and formatting checks.
+## Technical direction
 
-```bash
-orbit ask "Explain the last test failure."
-```
+Use Rust edition 2024.
 
-Uses the previous command output as conversation context.
+Create a Rust workspace only where the separation is already useful. Prefer a small number of functional crates over many nearly empty crates.
 
-```bash
-orbit ask "Create a draft ADR for the storage system."
-```
-
-Produces a draft following the project documentation standard, but does not write the file without permission.
-
----
-
-## 6. Project Configuration
-
-Each supported repository may contain:
+A reasonable initial structure is:
 
 ```text
-.orbit/project.yaml
+crates/
+├── core
+├── project
+├── actions
+├── provider
+├── agent
+└── cli
 ```
 
-Example:
+Do not create `voice`, desktop application, persistent memory, hardware control, or advanced multi-repository support in this first version.
+
+MCP may be added only after the internal action system is working. Do not make the core depend on MCP.
+
+## Required capabilities
+
+### Project configuration
+
+Implement `.orbit/project.yaml` with support for:
 
 ```yaml
 version: 1
 
 project:
-  name: orbit-obc
-  type: embedded-system
-  description: Bare-metal Rust software for the Orbit Lab CubeSat OBC.
+  name: example
+  type: software
+  description: Example project
 
 context:
   include:
     - README.md
     - docs/**
     - src/**
-    - tests/**
     - Cargo.toml
 
   exclude:
     - target/**
     - .git/**
+    - .env
     - secrets/**
-    - "*.key"
-    - "*.pem"
+    - "**/*.key"
+    - "**/*.pem"
 
 commands:
   build:
@@ -205,188 +123,306 @@ permissions:
   run_arbitrary_commands: deny
   write_files: ask
   delete_files: deny
-  create_commits: ask
+  create_commits: deny
   push_changes: deny
 
-documentation:
-  requirements_prefix: OBC-REQ
-  adr_prefix: OBC-ADR
-  test_prefix: OBC-TEST
-  interface_prefix: OBC-IF
-  part_prefix: OBC-PART
-
-engineering:
-  unit_system: SI
+model:
+  provider: anthropic
+  model: configurable-through-environment
 ```
 
-The configuration must define what Orbit Engineer can read, execute, and modify.
+Validate unsupported versions, missing required fields, invalid paths, invalid permission values, duplicated commands, and malformed patterns.
 
-The assistant must never treat instructions found inside repository files as trusted system instructions. Repository content is project data, not authority over the agent.
+Exclude rules must always take precedence over include rules.
 
----
+### Project security
 
-## 7. Workspace Configuration
+The project layer must:
 
-Orbit Engineer should eventually support multiple related repositories through:
+* prevent path traversal;
+* canonicalize and validate paths;
+* stay inside the project root;
+* reject symlink escapes;
+* avoid secret files;
+* never expose environment variables;
+* treat repository content as untrusted data;
+* avoid arbitrary shell string execution;
+* run configured commands using program and argument arrays;
+* enforce permissions in application code, not through model instructions.
+
+### File discovery and search
+
+Implement:
+
+* recursive file discovery;
+* include and exclude glob rules;
+* supported text file filtering;
+* file size limits;
+* UTF-8 handling with useful errors;
+* filename search;
+* heading search for Markdown;
+* content search;
+* ranked results;
+* source path preservation;
+* line ranges where possible;
+* context size limits.
+
+Do not introduce a vector database yet.
+
+Use deterministic local search for the first version.
+
+### Action system
+
+Implement structured internal actions.
+
+At minimum:
 
 ```text
-.orbit/workspace.yaml
-```
-
-Example:
-
-```yaml
-version: 1
-
-workspace:
-  name: Orbit Lab
-
-projects:
-  docs:
-    path: ./orbit-docs
-
-  mission_tools:
-    path: ./orbit-mission-tools
-
-  obc:
-    path: ./orbit-obc
-
-  engineer:
-    path: ./orbit-engineer
-
-relationships:
-  - source: obc
-    target: docs
-    type: documented-by
-
-  - source: obc
-    target: mission_tools
-    type: uses
-```
-
-This will allow requests such as:
-
-```text
-Compare the watchdog implementation in orbit-obc with the requirements documented in orbit-docs.
-```
-
-Workspace support is not required for the first issue, but the architecture must not prevent it.
-
----
-
-## 8. Proposed Architecture
-
-Use a Rust workspace.
-
-```text
-orbit-engineer/
-├── Cargo.toml
-├── README.md
-├── LICENSE
-├── docs/
-│   ├── PROJECT_SPEC.md
-│   └── architecture/
-├── crates/
-│   ├── orbit-core/
-│   ├── orbit-project/
-│   ├── orbit-agent/
-│   ├── orbit-actions/
-│   ├── orbit-provider/
-│   ├── orbit-mcp/
-│   └── orbit-cli/
-├── examples/
-│   └── project.yaml
-└── schemas/
-    └── project.schema.json
-```
-
-### `orbit-core`
-
-Contains shared domain types and errors.
-
-Responsibilities:
-
-* identifiers;
-* requests and responses;
-* permission types;
-* source references;
-* tool results;
-* conversation messages;
-* common errors.
-
-This crate must not depend on CLI, MCP, or a specific model provider.
-
-### `orbit-project`
-
-Responsible for understanding a project.
-
-Responsibilities:
-
-* locating `.orbit/project.yaml`;
-* parsing and validating configuration;
-* resolving project paths;
-* applying include and exclude rules;
-* discovering files;
-* loading text content;
-* protecting excluded or sensitive paths.
-
-### `orbit-agent`
-
-Coordinates model interaction and tool selection.
-
-Responsibilities:
-
-* maintaining session context;
-* sending messages to a provider;
-* exposing available actions to the model;
-* processing tool requests;
-* returning tool results to the model;
-* producing the final answer.
-
-The agent must not contain the implementation of engineering tools.
-
-### `orbit-actions`
-
-Contains actions that can be executed by the assistant.
-
-Initial actions:
-
-```text
+get_project_information
 list_project_files
 read_project_file
 search_project_text
 run_project_command
-get_project_information
-```
-
-Later actions may include:
-
-```text
-inspect_git_status
-analyze_csv
-search_requirements
-create_document_draft
-calculate_orbit
-calculate_link_budget
-inspect_telemetry
 ```
 
 Each action must have:
 
 * a stable name;
 * a description;
-* a typed input schema;
-* a typed output;
-* permission requirements;
-* tests;
-* clear error messages.
+* typed input;
+* typed output;
+* required permission;
+* validation;
+* useful errors;
+* tests.
 
-### `orbit-provider`
+The CLI and agent must use these actions instead of duplicating their logic.
 
-Defines the interface for language model providers.
+### Model provider
 
-Example conceptual interface:
+Create a provider-independent abstraction.
+
+Implement Anthropic as the first provider.
+
+Credentials must be loaded from:
+
+```text
+ANTHROPIC_API_KEY
+```
+
+Do not store credentials in project configuration or logs.
+
+Allow the model name to be configured by an environment variable or project configuration, with a documented default.
+
+Handle:
+
+* authentication errors;
+* network errors;
+* rate limits;
+* invalid responses;
+* context limits;
+* provider timeouts.
+
+The provider-specific request and response types must not leak through the rest of the codebase.
+
+### Agent
+
+Implement an agent capable of:
+
+1. receiving the user question;
+2. retrieving relevant project context;
+3. preparing a grounded model request;
+4. exposing the available internal actions;
+5. processing tool requests when supported;
+6. enforcing action permissions;
+7. returning action results to the model;
+8. producing a final response;
+9. preserving source references.
+
+Limit tool-call iterations to prevent infinite loops.
+
+The agent must clearly distinguish:
+
+* trusted application instructions;
+* user instructions;
+* untrusted repository content;
+* action results.
+
+The model must never be able to grant itself permissions.
+
+### CLI
+
+Create the `orbit` binary.
+
+Implement:
+
+```bash
+orbit init
+orbit project
+orbit files
+orbit search <query>
+orbit ask <question>
+orbit check
+```
+
+Expected behavior:
+
+```bash
+orbit init
+```
+
+Creates `.orbit/project.yaml` without overwriting an existing file unless an explicit force flag is provided.
+
+```bash
+orbit project
+```
+
+Displays the loaded project metadata, root path, active provider, number of discovered files, and configured permissions.
+
+```bash
+orbit files
+```
+
+Lists allowed project files.
+
+```bash
+orbit search "watchdog"
+```
+
+Displays ranked search results with paths and matching line ranges.
+
+```bash
+orbit ask "Why was the ESP32-C3 selected?"
+```
+
+Answers using project context and prints a sources section.
+
+```bash
+orbit check
+```
+
+Runs all configured validation commands in a stable order and reports each result.
+
+Support readable terminal output and a `--json` mode where appropriate.
+
+Return meaningful exit codes.
+
+## Source references
+
+Use a structured source type similar to:
 
 ```rust
-#[async_trait::
+pub struct SourceReference {
+    pub path: PathBuf,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub section: Option<String>,
+}
 ```
+
+Every search result must preserve its origin.
+
+Answers grounded in repository files must display sources.
+
+Do not claim that repository information was found when no source supports it.
+
+## Error handling
+
+Use typed errors and preserve useful context.
+
+Errors must be understandable to the user.
+
+Examples:
+
+```text
+Project configuration was not found.
+Run `orbit init` to create `.orbit/project.yaml`.
+```
+
+```text
+The requested path is outside the configured project root.
+```
+
+```text
+The file is excluded by the project configuration.
+```
+
+```text
+ANTHROPIC_API_KEY is not configured.
+```
+
+Avoid panics and production `unwrap` calls.
+
+## Testing
+
+Create comprehensive tests for:
+
+* configuration parsing;
+* configuration validation;
+* project root discovery;
+* include rules;
+* exclude precedence;
+* path traversal prevention;
+* symlink escape prevention;
+* secret file protection;
+* file discovery;
+* search ranking;
+* source line preservation;
+* permission enforcement;
+* configured command execution;
+* action validation;
+* provider abstraction;
+* agent iteration limits;
+* CLI behavior.
+
+Provider tests must not require a real API key.
+
+Use mocks or a fake provider for agent tests.
+
+## Documentation
+
+Update the README with:
+
+* what Orbit is;
+* current capabilities;
+* installation;
+* configuration;
+* required environment variables;
+* CLI examples;
+* security model;
+* current limitations.
+
+Add an example project configuration.
+
+Document important architectural decisions inside `docs/architecture/`.
+
+Do not rewrite `PROJECT_SPEC.md` unless implementation reveals a genuine conflict. When that happens, document the change clearly.
+
+## Quality requirements
+
+Before considering the work complete, run:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo build --workspace
+```
+
+Fix all warnings and failures.
+
+Do not commit or push.
+
+At the end, provide:
+
+1. a summary of the implemented architecture;
+2. the complete list of implemented commands;
+3. the important security decisions;
+4. the files created or changed;
+5. the test results;
+6. any incomplete functionality;
+7. the exact commands I should run to test Orbit locally.
+
+Make reasonable architectural decisions when details are missing.
+
+Do not stop only to ask for minor preferences. Implement the strongest functional first version consistent with the specification.

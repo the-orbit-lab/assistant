@@ -141,6 +141,31 @@ mod tests {
     }
 
     #[test]
+    fn default_include_covers_root_level_docs_beyond_readme() {
+        // Regression test: a project with no explicit `context.include`
+        // (the common case straight out of `orbit init`) must still see
+        // every root-level markdown doc -- not just README.md -- so files
+        // like CLAUDE.md are visible to search/read/ask instead of being
+        // silently invisible to every grounded answer.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::write(root.join("README.md"), "# Demo").unwrap();
+        fs::write(root.join("CLAUDE.md"), "# Instructions").unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/PROJECT_SPEC.md"), "# Spec").unwrap();
+
+        let config = ProjectConfig::parse("version: 1\nproject:\n  name: demo\n").unwrap();
+        let files = discover_files(&root, &config).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|f| f.relative_path.to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"README.md".to_string()));
+        assert!(names.contains(&"CLAUDE.md".to_string()));
+        assert!(names.contains(&"docs/PROJECT_SPEC.md".to_string()));
+    }
+
+    #[test]
     fn exclude_precedence_prunes_directories() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();

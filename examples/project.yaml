@@ -22,6 +22,7 @@ context:
   # Files Orbit is allowed to read, search, and use as answer sources.
   include:
     - README.md
+    - "*.md"       # any other root-level doc, e.g. CLAUDE.md
     - Cargo.toml
     - docs/**
     - src/**

@@ -31,6 +31,7 @@ impl Action for ListFilesAction {
         _input: ActionInput,
     ) -> Result<ActionOutput, OrbitError> {
         let files = discover_files(&ctx.root, &ctx.config)?;
+        tracing::debug!(root = %ctx.root.display(), discovered_file_count = files.len(), "discovered project files");
         let entries: Vec<Value> = files
             .iter()
             .map(|f| {

@@ -80,8 +80,11 @@ orbit ask "What does this project do?"
 
 Global flags: `--project <dir>`, `--config <path>`, `--json`, `--model
 <name>`, `--ollama-endpoint <url>`, `--yes` (approve `ask`-permission
-actions non-interactively). Exit code `2` means "no project configuration
-found"; `1` is a general error; `0` is success.
+actions non-interactively), `--verbose` (log resolved project root/config,
+discovered-file counts, tools offered to the model, tool calls it made,
+and action results to stderr — never file contents or secrets; `RUST_LOG`
+overrides it with full `tracing` filter syntax). Exit code `2` means "no
+project configuration found"; `1` is a general error; `0` is success.
 
 ```bash
 orbit search "watchdog"

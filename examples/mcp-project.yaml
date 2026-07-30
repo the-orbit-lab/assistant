@@ -17,6 +17,7 @@ model:
 context:
   include:
     - README.md
+    - "*.md"
     - Cargo.toml
     - docs/**
     - src/**

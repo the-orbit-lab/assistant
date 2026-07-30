@@ -44,6 +44,12 @@ impl Action for InformationAction {
         _input: ActionInput,
     ) -> Result<ActionOutput, OrbitError> {
         let discovered = discover_files(&ctx.root, &ctx.config)?;
+        tracing::debug!(
+            root = %ctx.root.display(),
+            config_path = %ctx.config_path.display(),
+            discovered_file_count = discovered.len(),
+            "project.information executed"
+        );
 
         let commands: Value = ctx
             .config

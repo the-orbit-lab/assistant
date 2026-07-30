@@ -32,6 +32,12 @@ pub fn resolve_project(global: &GlobalArgs) -> Result<Loaded, OrbitError> {
         orbit_project::discover_project_root(&cwd)?
     };
 
+    tracing::debug!(
+        root = %paths.root.display(),
+        config_path = %paths.config_path.display(),
+        "resolved project"
+    );
+
     let mut config = ProjectConfig::load(&paths.config_path)?;
     if let Some(model) = &global.model {
         config.model.model = model.clone();
@@ -39,6 +45,11 @@ pub fn resolve_project(global: &GlobalArgs) -> Result<Loaded, OrbitError> {
     if let Some(endpoint) = &global.ollama_endpoint {
         config.model.endpoint = endpoint.clone();
     }
+    tracing::debug!(
+        include = ?config.context.include,
+        exclude = ?config.context.exclude,
+        "loaded project configuration"
+    );
 
     Ok(Loaded { paths, config })
 }

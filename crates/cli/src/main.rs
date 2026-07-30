@@ -13,6 +13,7 @@ use args::{Cli, Command, McpCommand};
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    init_tracing(cli.global.verbose);
     match dispatch(cli).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
@@ -25,6 +26,34 @@ async fn main() -> std::process::ExitCode {
             }
         }
     }
+}
+
+/// Always logs to stderr (stdout carries `mcp serve`'s JSON-RPC traffic
+/// and `--json` output, neither of which may be polluted by log lines).
+/// `RUST_LOG` takes precedence, using normal `tracing` filter syntax;
+/// `--verbose` is a coarse default for "show me what Orbit is doing"
+/// without needing to know that syntax. Logs are debug-level summaries
+/// only -- action names, paths, counts, durations -- never file contents,
+/// secrets, or environment variable values.
+fn init_tracing(verbose: bool) {
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|v| tracing_subscriber::EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| {
+            let default = if verbose {
+                "warn,orbit_cli=debug,orbit_agent=debug,orbit_actions=debug,orbit_mcp_client=debug"
+            } else {
+                "warn"
+            };
+            tracing_subscriber::EnvFilter::new(default)
+        });
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .init();
 }
 
 async fn dispatch(cli: Cli) -> Result<(), OrbitError> {

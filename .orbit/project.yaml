@@ -1,0 +1,82 @@
+version: 1
+
+project:
+  name: "assistant"
+  type: "software"
+  description: ""
+
+model:
+  # Orbit's first-class provider is a local Ollama instance.
+  provider: ollama
+  model: qwen2.5:latest
+  endpoint: http://localhost:11434
+
+context:
+  # Files Orbit is allowed to read, search, and use as answer sources.
+  include:
+    - README.md
+    - "*.md"       # any other root-level doc, e.g. CLAUDE.md
+    - Cargo.toml
+    - docs/**
+    - src/**
+    - tests/**
+
+  # Exclude always wins over include. A mandatory set (.git, .orbit, secrets,
+  # *.key, *.pem, .env*, target, node_modules) is enforced in addition to
+  # this list and cannot be disabled from this file.
+  exclude:
+    - target/**
+    - .git/**
+    - .env
+    - .env.*
+    - secrets/**
+    - "**/*.key"
+    - "**/*.pem"
+
+commands:
+  build:
+    program: cargo
+    args:
+      - build
+
+  test:
+    program: cargo
+    args:
+      - test
+
+  lint:
+    program: cargo
+    args:
+      - clippy
+      - --workspace
+      - --all-targets
+      - --all-features
+      - --
+      - -D
+      - warnings
+
+  format:
+    program: cargo
+    args:
+      - fmt
+      - --check
+
+permissions:
+  project.information: allow
+  project.list_files: allow
+  project.read_file: allow
+  project.search: allow
+  command.list: allow
+  command.run_configured: ask
+
+mcp:
+  # Native actions exported to external MCP hosts (e.g. Claude Code).
+  # Nothing is exported unless listed here.
+  expose:
+    - project.information
+    - project.search
+    - project.read_file
+
+  # External stdio MCP servers Orbit itself may consume, namespaced as
+  # mcp.<server>.<tool>. Empty by default.
+  servers: {}

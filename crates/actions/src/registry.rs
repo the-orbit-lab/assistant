@@ -13,6 +13,12 @@ use serde_json::Value;
 /// Everything a native action needs to run: the project's security
 /// boundary and its validated configuration.
 pub struct ActionContext {
+    /// Must be absolute and canonicalized (symlinks resolved), matching
+    /// [`orbit_core::ProjectPaths::root`]. Path-resolving actions compare a
+    /// canonicalized candidate path against this field to catch symlink
+    /// escapes; a non-canonical root (e.g. `/tmp/x` on macOS, where `/tmp`
+    /// itself is a symlink to `/private/tmp`) makes that comparison fail
+    /// for every request, not just malicious ones.
     pub root: PathBuf,
     pub config_path: PathBuf,
     pub config: ProjectConfig,
@@ -85,6 +91,7 @@ impl ActionRegistry {
         confirmation: &dyn ConfirmationProvider,
     ) -> (ExecutionRecord, Result<ActionOutput, OrbitError>) {
         let started_at = SystemTime::now();
+        tracing::debug!(action = name, "executing action");
 
         let Some(action) = self.get(name) else {
             let err = OrbitError::UnknownAction {
@@ -148,14 +155,23 @@ impl ActionRegistry {
         result: Result<ActionOutput, OrbitError>,
     ) -> (ExecutionRecord, Result<ActionOutput, OrbitError>) {
         let finished_at = SystemTime::now();
+        let success = result.is_ok();
         let record = ExecutionRecord {
             action: name.to_string(),
             permission_outcome,
             started_at,
             finished_at,
-            success: result.is_ok(),
+            success,
             error_summary: result.as_ref().err().map(|e| e.to_string()),
         };
+        tracing::debug!(
+            action = name,
+            success,
+            permission = ?permission_outcome,
+            duration_ms = record.duration().as_millis() as u64,
+            error = record.error_summary.as_deref(),
+            "action finished"
+        );
         (record, result)
     }
 }

@@ -71,6 +71,13 @@ impl Action for SearchAction {
             options.limit = limit.min(MAX_ALLOWED_LIMIT);
         }
         let results = search_files(&files, &parsed.query, &options);
+        tracing::debug!(
+            query = %parsed.query,
+            files_scanned = files.len(),
+            result_count = results.len(),
+            paths = ?results.iter().map(|r| r.source.path.display().to_string()).collect::<Vec<_>>(),
+            "project.search executed"
+        );
 
         let sources = results.iter().map(|r| r.source.clone()).collect();
         let entries: Vec<Value> = results

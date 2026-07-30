@@ -73,6 +73,8 @@ impl Action for ReadFileAction {
 
         let relative = PathBuf::from(&parsed.path);
         let content = read_allowed_file(&ctx.root, &ctx.config, &relative, limit)?;
+        // Never log file content -- only that a read happened and its size.
+        tracing::debug!(path = %parsed.path, bytes = content.len(), "project.read_file executed");
 
         Ok(ActionOutput::new(json!({
             "path": parsed.path,

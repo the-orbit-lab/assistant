@@ -9,6 +9,7 @@ use orbit_core::{
 use orbit_providers::ModelProvider;
 
 use crate::prompt::system_prompt;
+use crate::retrieval;
 
 pub const DEFAULT_MAX_ITERATIONS: u32 = 8;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -89,11 +90,42 @@ impl Agent {
                 input_schema: d.input_schema,
             })
             .collect();
+        tracing::debug!(
+            tool_count = tools.len(),
+            tools = ?tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "tools offered to model"
+        );
 
         let mut sources = Vec::new();
         let mut records = Vec::new();
 
-        for _ in 0..self.max_iterations {
+        // Broad "what does this do" questions have no keyword a search
+        // could key off, and a small local model unreliably decides on its
+        // own to call project.information -> project.search ->
+        // project.read_file in the right order. Do it deterministically
+        // instead of hoping the model gets there.
+        if retrieval::is_broad_overview_question(question) {
+            tracing::debug!(
+                question,
+                "broad overview question detected; running deterministic retrieval"
+            );
+            let (retrieved_sources, retrieved_records) = retrieval::run(
+                &self.registry,
+                &self.context,
+                self.confirmation.as_ref(),
+                history,
+            )
+            .await;
+            tracing::debug!(
+                sources = retrieved_sources.len(),
+                "deterministic retrieval complete"
+            );
+            sources.extend(retrieved_sources);
+            records.extend(retrieved_records);
+        }
+
+        for iteration in 0..self.max_iterations {
+            tracing::debug!(iteration, "requesting model completion");
             let request = ModelRequest {
                 model: self.context.config.model.model.clone(),
                 messages: history.clone(),
@@ -107,6 +139,10 @@ impl Agent {
                 && !response.message.tool_calls.is_empty()
             {
                 let calls = response.message.tool_calls.clone();
+                tracing::debug!(
+                    calls = ?calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                    "model requested tool calls"
+                );
                 history.push(response.message);
 
                 for call in calls {
@@ -119,6 +155,13 @@ impl Agent {
                             self.confirmation.as_ref(),
                         )
                         .await;
+                    tracing::debug!(
+                        action = %call.name,
+                        success = record.success,
+                        permission = ?record.permission_outcome,
+                        duration_ms = record.duration().as_millis() as u64,
+                        "action execution finished"
+                    );
                     records.push(record);
 
                     match result {
@@ -131,13 +174,20 @@ impl Agent {
                         }
                     }
                 }
+                tracing::debug!(total_sources = sources.len(), "sources collected so far");
                 continue;
             }
 
             history.push(response.message.clone());
+            let sources = dedupe_sources(sources);
+            tracing::debug!(
+                answer_len = response.message.content.len(),
+                source_count = sources.len(),
+                "agent run finished"
+            );
             return Ok(AgentOutcome {
                 answer: response.message.content,
-                sources: dedupe_sources(sources),
+                sources,
                 records,
             });
         }
@@ -167,13 +217,18 @@ mod tests {
     use serde_json::json;
 
     fn context(root: &std::path::Path) -> Arc<ActionContext> {
+        // ActionContext::root must be canonical (see its doc comment) --
+        // tempfile's paths go through a symlink on macOS (/tmp ->
+        // /private/tmp), so path-resolving actions like project.read_file
+        // would otherwise see every request as a symlink escape.
+        let root = root.canonicalize().unwrap();
         let config = ProjectConfig::parse(
             "version: 1\nproject:\n  name: demo\n  description: a demo project\ncontext:\n  include:\n    - \"**/*\"\n",
         )
         .unwrap();
         Arc::new(ActionContext {
-            root: root.to_path_buf(),
             config_path: root.join(".orbit/project.yaml"),
+            root,
             config,
         })
     }
@@ -302,6 +357,86 @@ mod tests {
             err,
             OrbitError::AgentIterationLimitReached { limit: 3 }
         ));
+    }
+
+    /// Regression test for a real failure: `orbit ask "What does this
+    /// repository do?"` answered "no explicit descriptions ... found" even
+    /// though the temp repo has a README and a docs/PROJECT_SPEC.md that
+    /// plainly describe it. Root cause was the local model deciding not to
+    /// call any tool for a vague question. This reproduces that exact
+    /// model behavior with a mock (a Stop response with no tool call, on
+    /// the very first turn) and asserts that grounding happened anyway:
+    /// the README/spec content must have reached the provider, and the
+    /// final sources must reference them.
+    #[tokio::test]
+    async fn broad_overview_question_is_grounded_even_if_the_model_never_calls_a_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("README.md"),
+            "# Orbit\n\nOrbit is a local-first AI engineering assistant that inspects a \
+             project's files, runs deterministic actions, and answers grounded in real \
+             sources.\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(
+            tmp.path().join("docs/PROJECT_SPEC.md"),
+            "# Project Specification\n\nOrbit must inspect allowed project files, call \
+             actions, enforce permissions, and explain its answers with sources.\n",
+        )
+        .unwrap();
+
+        // Exactly the reported bug: the model never requests a tool call
+        // and answers immediately from nothing.
+        let provider = Arc::new(MockProvider::new(vec![orbit_core::ModelResponse {
+            message: Message::assistant("I could not find a clear description."),
+            finish_reason: FinishReason::Stop,
+        }]));
+
+        let agent = Agent::new(
+            provider.clone(),
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        );
+        let mut history = Vec::new();
+        let outcome = agent
+            .run(&mut history, "What does this repository do?")
+            .await
+            .unwrap();
+
+        assert!(
+            !outcome.sources.is_empty(),
+            "expected sources from deterministic retrieval, got none"
+        );
+        assert!(
+            outcome
+                .sources
+                .iter()
+                .any(|s| s.path.ends_with("README.md")),
+            "expected README.md among sources, got {:?}",
+            outcome.sources
+        );
+
+        // The requirement is stronger than "sources were recorded": the
+        // actual grounding text must have been sent to the provider before
+        // it ever answered.
+        let sent_requests = provider.recorded_requests();
+        assert!(!sent_requests.is_empty());
+        let all_sent_text: String = sent_requests
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_sent_text.contains("local-first AI engineering assistant"),
+            "README content did not reach the model:\n{all_sent_text}"
+        );
+        assert!(
+            all_sent_text.contains("enforce permissions"),
+            "docs/PROJECT_SPEC.md content did not reach the model:\n{all_sent_text}"
+        );
     }
 
     #[tokio::test]

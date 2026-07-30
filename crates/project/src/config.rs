@@ -103,6 +103,11 @@ pub struct ContextConfig {
 fn default_include() -> Vec<String> {
     vec![
         "README.md".to_string(),
+        // Any other root-level instructions/overview doc (CLAUDE.md,
+        // CONTRIBUTING.md, ...). Without this, a file like CLAUDE.md is
+        // invisible to every action and to grounded answers even though
+        // it plainly describes the project.
+        "*.md".to_string(),
         "Cargo.toml".to_string(),
         "docs/**".to_string(),
         "src/**".to_string(),
@@ -274,6 +279,7 @@ context:
   # Files Orbit is allowed to read, search, and use as answer sources.
   include:
     - README.md
+    - "*.md"       # any other root-level doc, e.g. CLAUDE.md
     - Cargo.toml
     - docs/**
     - src/**

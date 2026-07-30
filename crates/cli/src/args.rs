@@ -44,6 +44,14 @@ pub struct GlobalArgs {
     /// anything gated by `ask`.
     #[arg(long, global = true)]
     pub yes: bool,
+
+    /// Log project/agent internals to stderr: resolved root and config,
+    /// discovered-file counts, tools offered to the model, tool calls it
+    /// made, and action results. Never logs file contents, secrets, or
+    /// environment variables. `RUST_LOG` overrides this with full
+    /// `tracing` filter syntax (e.g. `RUST_LOG=orbit_agent=trace`).
+    #[arg(long, global = true)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand)]

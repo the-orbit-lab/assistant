@@ -24,32 +24,82 @@ mcp:
     - project.read_file
 ```
 
-An action left off this list does not appear in `tools/list` and cannot be
-called by name; the server never prompts interactively, so any exposed
-action left at the `ask` permission is effectively unreachable through MCP
-until the project sets it to `allow`.
+### Permission behavior for `allow` / `ask` / `deny`
+
+`mcp.expose` lists action *names*; whether an exposed name is actually
+reachable depends on its effective permission, resolved by
+`orbit_mcp_server::compute_exposure` the same way the CLI and agent
+resolve permissions everywhere else:
+
+```text
+allow → listed in tools/list and callable
+ask   → never listed. This transport has no way to obtain a safe,
+        explicit per-call approval, so rather than inventing an automatic
+        approval mechanism, the action is excluded. Calling it by name
+        anyway returns a specific error naming the fix: set it to
+        `allow` in .orbit/project.yaml.
+deny  → never listed, exactly as if it were absent from mcp.expose.
+```
+
+A name in `mcp.expose` that doesn't match any registered action is also
+excluded, with its own warning (a likely typo) rather than silently doing
+nothing. Duplicate entries collapse to one. Every one of these cases
+produces an actionable line from `orbit mcp serve` (stderr, at startup)
+and from `orbit doctor` — see below.
 
 ### Connecting Claude Code
 
-Add Orbit as a project-scoped or user-scoped MCP server, pointing at the
-built binary and the project you want it to serve:
+Point Claude Code at the built `orbit` binary and the project it should
+serve. Two ways to register it (confirmed against Claude Code 2.1.220):
+
+**`claude mcp add`** (recommended — validates the command for you):
+
+```bash
+claude mcp add orbit -- /absolute/path/to/orbit --project /absolute/path/to/project mcp serve
+```
+
+**A project-scoped `.mcp.json`** (or your global Claude Code MCP config),
+using the same `mcpServers` shape either file uses:
 
 ```json
 {
   "mcpServers": {
     "orbit": {
-      "command": "/path/to/orbit",
-      "args": ["mcp", "serve", "--project", "/path/to/your/project"]
+      "command": "/absolute/path/to/orbit",
+      "args": [
+        "--project",
+        "/absolute/path/to/project",
+        "mcp",
+        "serve"
+      ]
     }
   }
 }
 ```
 
-(Exact file location and CLI for registering this depends on how you run
-Claude Code — see Claude Code's own MCP documentation for where this
-config lives.) Any MCP-compatible host works the same way, since Orbit
-speaks the standard stdio JSON-RPC protocol — Orbit does not depend on
-Claude Code specifically, and never requires an Anthropic API key.
+Both forms are equivalent — `orbit`'s `--project` flag is a normal global
+flag, so it can appear before or after the `mcp serve` subcommand. Use
+absolute paths for both the binary and the project; replace the
+placeholders above with your own. Any MCP-compatible host works the same
+way, since Orbit speaks the standard stdio JSON-RPC protocol — Orbit does
+not depend on Claude Code specifically, and never requires an
+`ANTHROPIC_API_KEY` (Claude Code's own authentication is external to, and
+irrelevant to, the Orbit MCP server it's talking to).
+
+### Verifying the connection
+
+Ask the connected host (in Claude Code, a normal prompt) to:
+
+1. list Orbit's tools;
+2. call `project.information`;
+3. search for `engineering assistant`;
+4. read `README.md`;
+5. summarize the project using the sources those calls returned.
+
+Or drive the same sequence yourself with any raw JSON-RPC-over-stdio
+client — `crates/cli/tests/mcp_protocol.rs` does exactly this against a
+real `orbit mcp serve` subprocess and is a working reference for the
+message shapes.
 
 ## As a client: consuming other MCP servers
 
@@ -82,6 +132,25 @@ registered into the *same* `ActionRegistry` as native actions:
 - **Clean shutdown.** Every connected server is cancelled when the
   session ends.
 
+## `orbit doctor`
+
+Checks, in addition to the project/Ollama checks in [OLLAMA.md](OLLAMA.md):
+
+- `mcp export configuration` / `mcp exposure`: runs the exact exposure
+  resolution above and reports one `WARN` line per excluded entry (e.g.
+  `MCP exposure `project.write_file` requires confirmation and cannot be
+  used through the current non-interactive MCP transport.`), or one `OK`
+  with a count if everything configured resolves cleanly.
+- `mcp server initialization`: actually constructs `OrbitMcpServer` for
+  the active project and runs a real `initialize` + `tools/list` round
+  trip against it over an in-process transport (no subprocess, no real
+  `stdio`) — a genuine check that the server can start and answer, not
+  just that its constructor doesn't panic.
+- `mcp stdout reservation`: informational; the real guarantee (nothing but
+  protocol frames ever reaches stdout) is enforced by the protocol
+  integration tests below, which read every line of a real subprocess's
+  stdout and fail if any of it isn't valid JSON-RPC.
+
 ## Status and limitations
 
 - Transport: `stdio` only, both directions. Streamable HTTP is not wired
@@ -92,12 +161,21 @@ registered into the *same* `ActionRegistry` as native actions:
   Orbit does not currently synthesize `SourceReference`s for MCP tool
   output the way it does for native file-backed actions.
 
-## Testing without a live external server
+## Testing
 
-- `crates/mcp-server` tests spin up the real server against a real client
-  over an in-process `tokio::io::duplex` pipe — a genuine `initialize` +
-  `tools/list` + `tools/call` round trip, not a hand-built request
-  context.
+- `crates/cli/tests/mcp_protocol.rs`: spawns the real, compiled `orbit`
+  binary as a subprocess and speaks newline-delimited JSON-RPC to its
+  actual stdin/stdout — `initialize`, `tools/list`, and `tools/call`
+  against `project.information`/`list_files`/`read_file`/`search`, plus
+  rejection of `.env`, path traversal, and unexposed/unknown tool names.
+  Every line read from stdout is asserted to be valid JSON: this is what
+  actually proves the protocol channel is never polluted by a stray
+  `println!`, not just that the code looks like it wouldn't do that.
+- `crates/mcp-server` unit/protocol tests spin up the real server against
+  a real client over an in-process `tokio::io::duplex` pipe — genuine
+  `initialize`/`tools/list`/`tools/call` round trips, not hand-built
+  request contexts — covering exposure filtering for `allow`/`ask`/`deny`,
+  unknown-action warnings, and structured content.
 - `crates/mcp-client` tests cover namespacing and graceful degradation
   (an unreachable command produces a warning, not a panic) without
   needing a real external server installed.

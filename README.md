@@ -74,7 +74,7 @@ orbit ask "What does this project do?"
 | `orbit ask <question>` | One agent turn: model + tools, answer + sources. |
 | `orbit commands` | List configured commands and their required permission. |
 | `orbit run <name>` | Run one configured command (permission-checked). |
-| `orbit doctor` | Check config, Ollama connectivity, model availability, file discovery. |
+| `orbit doctor` | Check config, Ollama connectivity, model availability, file discovery, MCP exposure and server initialization. |
 | `orbit chat` | Multi-turn session; history lives in memory only. |
 | `orbit mcp serve` | Serve this project's exposed actions over MCP stdio. |
 

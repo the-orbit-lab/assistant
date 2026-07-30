@@ -99,9 +99,8 @@ can never grant itself permission to run one.
 A small local model does not reliably decide, on its own, to call the
 right tools for a vague question like "What does this repository do?" —
 there is no keyword in the question itself to search for. For questions
-matching that shape, `orbit-agent::retrieval` runs
-`project.information` → `project.search` (for the project's own name) →
-`project.read_file` (on whichever overview-shaped docs actually exist —
+matching that shape, `orbit-agent::retrieval` runs `project.information`
+→ `project.read_file` (on whichever overview-shaped docs actually exist —
 README, CLAUDE.md, a spec under `docs/`, ranked by an adaptive heuristic
 over the real file list) *before* the model's first turn, through the
 exact same `ActionRegistry::execute` a model-initiated call would use —
@@ -111,13 +110,31 @@ have to have decided to make them. Everything else (a specific question
 like "why was the ESP32-C3 selected?") is left entirely to the model's
 own tool-calling.
 
+An earlier version of this also ran `project.search` for the project's
+own name as a third step. It was removed: a bare project name is often a
+generic word, so that search matched incidental substrings in unrelated
+files (e.g. a dependency manifest's `repository = ".../assistant"` line)
+and those became noisy, irrelevant entries in the final answer's sources.
+`project.read_file` on ranked overview docs is precise by construction;
+a bare keyword search on the project's own name is not. Source quality is
+also enforced on the way out — see `dedupe_sources` in
+`crates/agent/src/agent.rs`: exact duplicates are dropped, a path-only
+reference is dropped in favor of a more precise line-ranged reference to
+the same file when both exist, and the model's answer text can never add
+a source that wasn't actually returned by an executed action.
+
 ## MCP: both directions
 
 - **Server** (`orbit mcp serve`): wraps `ActionRegistry` behind the MCP
   `stdio` transport. `list_tools`/`call_tool` are the only two things it
   adds; everything else — validation, permissions, execution — is the same
-  code path the CLI and agent use. Only actions listed in `mcp.expose` are
-  visible.
+  code path the CLI and agent use. Only `mcp.expose` entries whose
+  *effective permission is `allow`* are visible: `orbit-mcp-server::exposure`
+  resolves this once at startup (same `effective_permission` every other
+  layer uses), excluding `deny` outright and `ask` because this transport
+  has no interactive confirmation — see [MCP.md](MCP.md) for the exact
+  behavior and the warnings `orbit doctor`/`orbit mcp serve` produce for
+  each excluded entry.
 - **Client** (`orbit-mcp-client`, used by `orbit ask`/`orbit chat`):
   connects to each enabled server under `mcp.servers`, lists its tools, and
   wraps each one as an ordinary `Action` named `mcp.<server>.<tool>`. These

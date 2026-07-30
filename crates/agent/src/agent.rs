@@ -34,6 +34,7 @@ pub struct Agent {
     confirmation: Arc<dyn ConfirmationProvider>,
     max_iterations: u32,
     request_timeout: Duration,
+    builtin_overview_retrieval: bool,
 }
 
 impl Agent {
@@ -50,6 +51,7 @@ impl Agent {
             confirmation,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            builtin_overview_retrieval: true,
         }
     }
 
@@ -60,6 +62,19 @@ impl Agent {
 
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// The single-project `project.information` -> `project.read_file`
+    /// deterministic retrieval (see `retrieval::run`) only makes sense
+    /// when this agent's registry actually has those native actions
+    /// registered. A caller driving a *workspace*-scoped registry (only
+    /// `workspace.*` actions) does its own deterministic retrieval before
+    /// the first turn and should disable this, since attempting it here
+    /// would just be silently-failing `UnknownAction` calls against
+    /// `project.information`.
+    pub fn with_builtin_overview_retrieval(mut self, enabled: bool) -> Self {
+        self.builtin_overview_retrieval = enabled;
         self
     }
 
@@ -79,7 +94,21 @@ impl Agent {
             )));
         }
         history.push(Message::user(question));
+        self.continue_from_history(history, question).await
+    }
 
+    /// Like [`Agent::run`], but assumes the caller has already appended
+    /// the user's question (and, for a workspace-scoped caller, its own
+    /// pre-model deterministic retrieval) to `history` in the right
+    /// order. `question` is still needed to decide whether this agent's
+    /// own built-in broad-overview retrieval applies -- irrelevant when
+    /// [`Agent::with_builtin_overview_retrieval`] is `false`, which every
+    /// workspace-scoped caller sets, since it does that retrieval itself.
+    pub async fn continue_from_history(
+        &self,
+        history: &mut Vec<Message>,
+        question: &str,
+    ) -> Result<AgentOutcome, OrbitError> {
         let tools: Vec<ToolDefinition> = self
             .registry
             .descriptors()
@@ -104,7 +133,7 @@ impl Agent {
         // own to call project.information -> project.read_file in the
         // right order. Do it deterministically instead of hoping the
         // model gets there.
-        if retrieval::is_broad_overview_question(question) {
+        if self.builtin_overview_retrieval && retrieval::is_broad_overview_question(question) {
             tracing::debug!(
                 question,
                 "broad overview question detected; running deterministic retrieval"
@@ -351,6 +380,36 @@ mod tests {
         let outcome = agent.run(&mut history, "do something").await.unwrap();
         assert_eq!(outcome.answer, "I could not find that tool.");
         assert!(!outcome.records[0].success);
+    }
+
+    #[tokio::test]
+    async fn builtin_overview_retrieval_can_be_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("README.md"),
+            "# Orbit\n\nOrbit is a local-first AI engineering assistant.\n",
+        )
+        .unwrap();
+        let provider = Arc::new(MockProvider::new(vec![orbit_core::ModelResponse {
+            message: Message::assistant("no idea"),
+            finish_reason: FinishReason::Stop,
+        }]));
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_builtin_overview_retrieval(false);
+        let mut history = Vec::new();
+        let outcome = agent
+            .run(&mut history, "What does this repository do?")
+            .await
+            .unwrap();
+        assert!(
+            outcome.sources.is_empty(),
+            "retrieval was disabled, so no deterministic sources should appear"
+        );
     }
 
     #[tokio::test]

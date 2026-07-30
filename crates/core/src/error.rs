@@ -92,6 +92,36 @@ pub enum OrbitError {
     #[error("MCP error: {0}")]
     Mcp(String),
 
+    #[error(
+        "No `.orbit/workspace.yaml` was found searching upward from {searched_from}.\nRun `orbit workspace init` to create one."
+    )]
+    WorkspaceNotFound { searched_from: PathBuf },
+
+    #[error("Unknown project `{name}`. Available projects: {}", available.join(", "))]
+    UnknownProject {
+        name: String,
+        available: Vec<String>,
+    },
+
+    #[error(
+        "`{name}` matches more than one registered project or alias; use the exact registered name."
+    )]
+    AmbiguousProject { name: String },
+
+    #[error(
+        "No project is selected. Available projects: {}. Use --project <name> or run this from inside a registered project.",
+        available.join(", ")
+    )]
+    NoActiveProject { available: Vec<String> },
+
+    #[error("Project `{name}` is unavailable: {reason}")]
+    ProjectUnavailable { name: String, reason: String },
+
+    #[error(
+        "Workspace project `{name}` at `{path}` resolves outside the workspace root; refusing to load the workspace."
+    )]
+    WorkspaceProjectEscapesRoot { name: String, path: PathBuf },
+
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,

@@ -101,9 +101,9 @@ impl Agent {
 
         // Broad "what does this do" questions have no keyword a search
         // could key off, and a small local model unreliably decides on its
-        // own to call project.information -> project.search ->
-        // project.read_file in the right order. Do it deterministically
-        // instead of hoping the model gets there.
+        // own to call project.information -> project.read_file in the
+        // right order. Do it deterministically instead of hoping the
+        // model gets there.
         if retrieval::is_broad_overview_question(question) {
             tracing::debug!(
                 question,
@@ -198,11 +198,35 @@ impl Agent {
     }
 }
 
+/// Normalize a run's collected sources for display, in application code
+/// rather than trusting the model to have cited only what it was actually
+/// given:
+/// - an exact duplicate (same path, line range, section) is dropped;
+/// - a path-only ("whole file") reference is dropped when a more precise
+///   line-ranged reference to the *same* path also exists -- it adds no
+///   information once a specific location is known;
+/// - order is otherwise preserved exactly as sources were first
+///   encountered (not re-sorted), so the earliest, most directly retrieved
+///   evidence stays first.
+///
+/// This can only ever narrow `sources`, which itself only ever grows from
+/// real `ActionOutput::sources` returned by executed actions (see `run`
+/// above) -- the model's own answer text never contributes an entry, so it
+/// cannot invent a source path that nothing was actually retrieved from.
 fn dedupe_sources(sources: Vec<SourceReference>) -> Vec<SourceReference> {
+    let has_line_range: std::collections::HashSet<&std::path::PathBuf> = sources
+        .iter()
+        .filter(|s| s.line_start.is_some())
+        .map(|s| &s.path)
+        .collect();
+
     let mut deduped: Vec<SourceReference> = Vec::new();
-    for source in sources {
-        if !deduped.contains(&source) {
-            deduped.push(source);
+    for source in &sources {
+        if source.line_start.is_none() && has_line_range.contains(&source.path) {
+            continue;
+        }
+        if !deduped.contains(source) {
+            deduped.push(source.clone());
         }
     }
     deduped
@@ -475,5 +499,109 @@ mod tests {
             .find(|m| m.tool_call_id.as_deref() == Some("call_0"))
             .unwrap();
         assert!(tool_message.content.contains("denied"));
+    }
+
+    fn line_source(path: &str, line: usize) -> SourceReference {
+        SourceReference::lines(std::path::PathBuf::from(path), line, line)
+    }
+
+    fn whole_file_source(path: &str) -> SourceReference {
+        SourceReference::whole_file(std::path::PathBuf::from(path))
+    }
+
+    #[test]
+    fn dedupe_sources_drops_exact_duplicates() {
+        let sources = vec![line_source("README.md", 3), line_source("README.md", 3)];
+        assert_eq!(dedupe_sources(sources), vec![line_source("README.md", 3)]);
+    }
+
+    #[test]
+    fn dedupe_sources_drops_whole_file_reference_when_a_line_range_exists() {
+        let sources = vec![whole_file_source("README.md"), line_source("README.md", 3)];
+        assert_eq!(dedupe_sources(sources), vec![line_source("README.md", 3)]);
+
+        // Order of arrival should not matter.
+        let sources = vec![line_source("CLAUDE.md", 1), whole_file_source("CLAUDE.md")];
+        assert_eq!(dedupe_sources(sources), vec![line_source("CLAUDE.md", 1)]);
+    }
+
+    #[test]
+    fn dedupe_sources_keeps_whole_file_reference_when_no_line_range_exists_for_it() {
+        let sources = vec![whole_file_source("CLAUDE.md"), line_source("README.md", 3)];
+        assert_eq!(
+            dedupe_sources(sources),
+            vec![whole_file_source("CLAUDE.md"), line_source("README.md", 3)]
+        );
+    }
+
+    #[test]
+    fn dedupe_sources_preserves_first_seen_order_across_distinct_paths() {
+        let sources = vec![
+            line_source("docs/PROJECT_SPEC.md", 5),
+            line_source("README.md", 3),
+            line_source("docs/OLLAMA.md", 38),
+        ];
+        assert_eq!(dedupe_sources(sources.clone()), sources);
+    }
+
+    /// Regression test: a prior version of the noisy-answer bug let a
+    /// generic deterministic-retrieval search surface an incidental
+    /// substring match (`Cargo.toml`'s `repository = ".../assistant"`
+    /// line) as a "source" for an unrelated question. Sources must only
+    /// ever come from what an executed action actually returned, and the
+    /// model's own answer text must never add one, no matter what paths
+    /// it mentions.
+    #[tokio::test]
+    async fn model_cannot_invent_a_source_by_mentioning_a_path_in_its_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("watchdog.md"),
+            "# Watchdog\nkeeps things alive\n",
+        )
+        .unwrap();
+
+        let provider = Arc::new(MockProvider::new(vec![
+            orbit_core::ModelResponse {
+                message: Message::assistant_tool_calls(vec![ToolCall {
+                    id: "call_0".to_string(),
+                    name: "project.search".to_string(),
+                    arguments: json!({"query": "watchdog"}),
+                }]),
+                finish_reason: FinishReason::ToolCalls,
+            },
+            orbit_core::ModelResponse {
+                message: Message::assistant(
+                    "See secret-notes.md and Cargo.toml:99 for more details on the watchdog.",
+                ),
+                finish_reason: FinishReason::Stop,
+            },
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        );
+        let mut history = Vec::new();
+        let outcome = agent
+            .run(&mut history, "What does the watchdog do?")
+            .await
+            .unwrap();
+
+        assert!(
+            outcome
+                .sources
+                .iter()
+                .all(|s| s.path != std::path::Path::new("secret-notes.md")
+                    && s.path != std::path::Path::new("Cargo.toml")),
+            "the model's answer text must not be able to add sources: {:?}",
+            outcome.sources
+        );
+        assert!(
+            outcome
+                .sources
+                .iter()
+                .any(|s| s.path.ends_with("watchdog.md"))
+        );
     }
 }

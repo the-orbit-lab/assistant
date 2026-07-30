@@ -1,7 +1,6 @@
 .claude/
-target/
 .DS_Store
-
+.idea
 
 # Added by cargo
 

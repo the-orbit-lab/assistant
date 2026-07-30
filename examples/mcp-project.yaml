@@ -1,0 +1,71 @@
+# Example `.orbit/project.yaml` for a project that both exposes actions
+# over MCP and consumes an external MCP server as a client. See
+# docs/MCP.md for the full explanation of both directions.
+
+version: 1
+
+project:
+  name: obc
+  type: embedded-system
+  description: CubeSat onboard computer software, with GitHub issue tracking via MCP.
+
+model:
+  provider: ollama
+  model: qwen2.5:latest
+  endpoint: http://localhost:11434
+
+context:
+  include:
+    - README.md
+    - Cargo.toml
+    - docs/**
+    - src/**
+    - tests/**
+  exclude:
+    - target/**
+    - .git/**
+    - .env
+    - .env.*
+    - secrets/**
+    - "**/*.key"
+    - "**/*.pem"
+
+commands:
+  build:
+    program: cargo
+    args: [build]
+  test:
+    program: cargo
+    args: [test]
+
+permissions:
+  project.information: allow
+  project.list_files: allow
+  project.read_file: allow
+  project.search: allow
+  command.list: allow
+  command.run_configured: ask
+
+  # External MCP tools are namespaced mcp.<server>.<tool> and default to
+  # `ask` unless listed here explicitly, since they run code Orbit did not
+  # write. This project allows read-only GitHub issue listing without a
+  # prompt, but still asks before creating one.
+  mcp.github.list_issues: allow
+  mcp.github.create_issue: ask
+
+mcp:
+  # Orbit as a server: what this project exposes to external MCP hosts.
+  expose:
+    - project.search
+    - project.read_file
+
+  # Orbit as a client: external stdio MCP servers this project consumes.
+  # Orbit spawns each as a child process, lists its tools, and merges them
+  # into the same Action Runtime as native actions — same permission
+  # enforcement, same execution records.
+  servers:
+    github:
+      transport: stdio
+      command: github-mcp-server
+      args: []
+      enabled: true

@@ -1,0 +1,99 @@
+# Example `.orbit/project.yaml`. Copy this into a project's `.orbit/`
+# directory, or run `orbit init` to generate a starter version of this same
+# file automatically.
+#
+# Schema reference: ../schemas/project.schema.json
+
+version: 1
+
+project:
+  name: obc
+  type: embedded-system
+  description: CubeSat onboard computer software.
+
+model:
+  # Orbit's first-class provider is a local Ollama instance. No API key is
+  # used or required.
+  provider: ollama
+  model: qwen2.5:latest
+  endpoint: http://localhost:11434
+
+context:
+  # Files Orbit is allowed to read, search, and use as answer sources.
+  include:
+    - README.md
+    - Cargo.toml
+    - docs/**
+    - src/**
+    - tests/**
+
+  # Exclude always wins over include, and a mandatory set — .git/**,
+  # .orbit/**, target/**, node_modules/**, .env, .env.*, secrets/**,
+  # **/*.key, **/*.pem — is enforced in addition to this list and cannot be
+  # disabled from this file. See docs/SECURITY.md.
+  exclude:
+    - target/**
+    - .git/**
+    - .env
+    - .env.*
+    - secrets/**
+    - "**/*.key"
+    - "**/*.pem"
+
+commands:
+  build:
+    program: cargo
+    args:
+      - build
+
+  test:
+    program: cargo
+    args:
+      - test
+
+  lint:
+    program: cargo
+    args:
+      - clippy
+      - --workspace
+      - --all-targets
+      - --all-features
+      - --
+      - -D
+      - warnings
+
+  format:
+    program: cargo
+    args:
+      - fmt
+      - --check
+
+permissions:
+  # Keys are action names; values are one of allow, ask, deny. Any action
+  # not listed here falls back to its own conservative default (see
+  # `orbit project` or `orbit doctor` for the effective set).
+  project.information: allow
+  project.list_files: allow
+  project.read_file: allow
+  project.search: allow
+  command.list: allow
+  command.run_configured: ask
+
+  # Reserved for future native actions; harmless to leave configured now.
+  project.write_file: ask
+  project.delete_file: deny
+  git.commit: deny
+  git.push: deny
+
+mcp:
+  # Native actions exported to external MCP hosts (Claude Code, ChatGPT,
+  # ...) when running `orbit mcp serve`. Nothing is exported unless it is
+  # listed here — see docs/MCP.md.
+  expose:
+    - project.information
+    - project.search
+    - project.read_file
+
+  # External stdio MCP servers this project consumes as a client. Empty by
+  # default; see examples/mcp-project.yaml for a populated example.
+  servers: {}

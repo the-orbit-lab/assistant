@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://orbit-lab.dev/schemas/project.schema.json",
+  "title": "Orbit project configuration",
+  "description": "Schema for .orbit/project.yaml. Kept consistent with crates/project/src/config.rs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "project"],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Configuration schema version. Only 1 is currently supported."
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "type": { "type": "string", "minLength": 1, "default": "software" },
+        "description": { "type": "string", "default": "" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1, "default": "ollama" },
+        "model": { "type": "string", "minLength": 1, "default": "qwen2.5:latest" },
+        "endpoint": { "type": "string", "minLength": 1, "default": "http://localhost:11434" }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": ["README.md", "Cargo.toml", "docs/**", "src/**", "tests/**"]
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "description": "Combined at runtime with a mandatory, non-overridable exclude set (.git/**, .orbit/**, target/**, node_modules/**, .env, .env.*, secrets/**, **/*.key, **/*.pem)."
+        }
+      }
+    },
+    "commands": {
+      "type": "object",
+      "description": "Map of command name to program + argument array. Never a shell string.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["program"],
+        "properties": {
+          "program": { "type": "string", "minLength": 1 },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": []
+          }
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "description": "Map of action name (e.g. project.read_file, mcp.<server>.<tool>) to permission.",
+      "additionalProperties": { "enum": ["allow", "ask", "deny"] }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expose": {
+          "type": "array",
+          "description": "Native action names exported through `orbit mcp serve`. Nothing is exported unless listed here.",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        },
+        "servers": {
+          "type": "object",
+          "description": "External stdio MCP servers Orbit consumes as a client, namespaced mcp.<server>.<tool>.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["transport", "command"],
+            "properties": {
+              "transport": { "const": "stdio" },
+              "command": { "type": "string", "minLength": 1 },
+              "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "default": []
+              },
+              "enabled": { "type": "boolean", "default": true }
+            }
+          }
+        }
+      }
+    }
+  }
+}

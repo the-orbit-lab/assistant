@@ -1,0 +1,62 @@
+# Example `.orbit/workspace.yaml`. Copy this into a lab/monorepo-parent
+# directory's `.orbit/`, or run `orbit workspace init` from that directory
+# to generate a starter version of this same file automatically (it will
+# register any immediate child directory that already has its own
+# `.orbit/project.yaml`, leaving aliases/descriptions/relationships/default
+# blank for you to fill in).
+#
+# Schema reference: ../schemas/workspace.schema.json
+# Full behavior reference: ../docs/WORKSPACES.md
+
+version: 1
+
+workspace:
+  name: Orbit Lab
+  description: Sibling repositories for the Orbit Lab project.
+
+# Every entry here is a normal, independent Orbit project: it keeps its
+# own .orbit/project.yaml, its own root, and its own security boundary.
+# `path` is resolved against this file's directory and must never resolve
+# outside it (no `..` escapes, no symlink escapes) -- see SECURITY.md.
+projects:
+  assistant:
+    path: ./assistant
+    description: The Orbit assistant itself.
+
+  docs:
+    path: ./docs
+    description: Cross-project documentation and architecture decisions.
+
+  obc:
+    path: ./obc
+    aliases: [flight-computer]
+    description: CubeSat onboard computer software.
+
+  mission-tools:
+    path: ./mission-tools
+    description: Mission planning and analysis tooling.
+
+# Directional relationships between projects, e.g. "obc is documented-by
+# docs". Purely descriptive -- shown by `orbit workspace` and
+# workspace.information -- and never used to grant or infer access
+# between projects. Permission isolation between projects is enforced
+# regardless of what's declared here.
+relationships:
+  - source: obc
+    target: docs
+    type: documented-by
+
+defaults:
+  # Used for safe, read-only overview questions and single-project
+  # commands issued at the workspace root with nothing else selected.
+  # Commands that change anything (e.g. `orbit run`) never use this --
+  # they always require an explicit --project. See docs/WORKSPACES.md
+  # ("Default project").
+  project: assistant
+
+# Permissions for the workspace.* actions themselves (distinct from each
+# project's own `permissions`, which always still governs the per-project
+# native action a workspace action delegates to). Every workspace.*
+# action is read-only orchestration and defaults to `allow`; this section
+# is only needed to tighten that default.
+permissions: {}

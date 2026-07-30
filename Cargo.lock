@@ -1102,6 +1102,7 @@ dependencies = [
  "orbit-mcp-server",
  "orbit-project",
  "orbit-providers",
+ "orbit-workspace",
  "predicates",
  "serde_json",
  "tempfile",
@@ -1170,6 +1171,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "orbit-workspace"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "orbit-actions",
+ "orbit-core",
+ "orbit-project",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

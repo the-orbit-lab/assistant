@@ -923,6 +923,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-mcp-server"
+version = "0.1.0"
+dependencies = [
+ "orbit-actions",
+ "orbit-core",
+ "orbit-project",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "orbit-project"
 version = "0.1.0"
 dependencies = [

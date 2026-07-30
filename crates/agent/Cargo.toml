@@ -1,0 +1,19 @@
+[package]
+name = "orbit-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+orbit-core = { workspace = true }
+orbit-project = { workspace = true }
+orbit-actions = { workspace = true }
+orbit-providers = { workspace = true }
+orbit-mcp-client = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

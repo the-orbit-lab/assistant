@@ -900,6 +900,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-agent"
+version = "0.1.0"
+dependencies = [
+ "orbit-actions",
+ "orbit-core",
+ "orbit-mcp-client",
+ "orbit-project",
+ "orbit-providers",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "orbit-core"
 version = "0.1.0"
 dependencies = [

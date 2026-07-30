@@ -8,7 +8,6 @@
 //! exposes an action the project configuration didn't explicitly list in
 //! `mcp.expose`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use orbit_actions::{ActionContext, ActionRegistry};
@@ -23,6 +22,12 @@ use rmcp::transport::stdio;
 use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt};
 use serde_json::Value;
 
+mod exposure;
+mod self_check;
+
+pub use exposure::{ExposureIssue, ExposureReport, ExposureWarning, compute_exposure};
+pub use self_check::{SelfCheckReport, self_check};
+
 /// The MCP server never itself prompts interactively: an `ask`-permission
 /// action is only reachable through MCP once a project explicitly sets it
 /// to `allow` in `.orbit/project.yaml`.
@@ -31,19 +36,21 @@ const NON_INTERACTIVE: AlwaysDeny = AlwaysDeny;
 pub struct OrbitMcpServer {
     registry: Arc<ActionRegistry>,
     context: Arc<ActionContext>,
-    exposed: HashSet<String>,
+    exposure: ExposureReport,
     confirmation: Arc<dyn ConfirmationProvider>,
 }
 
 impl OrbitMcpServer {
-    /// `exposed` is the project's `mcp.expose` list. Actions not in this
-    /// set are invisible through MCP: not listed, and rejected if called
-    /// by name.
-    pub fn new(registry: ActionRegistry, context: ActionContext, exposed: Vec<String>) -> Self {
+    /// `expose` is the project's raw `mcp.expose` list. It is resolved
+    /// once here, against `registry` and `context.config`'s effective
+    /// permissions, into what can actually be listed and called -- see
+    /// [`compute_exposure`] for the exact `allow`/`ask`/`deny` behavior.
+    pub fn new(registry: ActionRegistry, context: ActionContext, expose: Vec<String>) -> Self {
+        let exposure = compute_exposure(&registry, &expose, &context.config);
         Self {
             registry: Arc::new(registry),
             context: Arc::new(context),
-            exposed: exposed.into_iter().collect(),
+            exposure,
             confirmation: Arc::new(NON_INTERACTIVE),
         }
     }
@@ -56,8 +63,15 @@ impl OrbitMcpServer {
         self
     }
 
+    /// Every `mcp.expose` entry that could not be listed, with a
+    /// human-readable reason -- for `orbit mcp serve` to print at startup
+    /// and `orbit doctor` to report.
+    pub fn exposure_warnings(&self) -> &[ExposureWarning] {
+        &self.exposure.warnings
+    }
+
     fn exposed_tool(&self, name: &str) -> Option<Tool> {
-        if !self.exposed.contains(name) {
+        if !self.exposure.listable.contains(name) {
             return None;
         }
         let descriptor = self
@@ -109,11 +123,10 @@ impl ServerHandler for OrbitMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools: Vec<Tool> = self
-            .registry
-            .descriptors()
-            .into_iter()
-            .filter(|d| self.exposed.contains(&d.name))
-            .filter_map(|d| self.exposed_tool(&d.name))
+            .exposure
+            .listable
+            .iter()
+            .filter_map(|name| self.exposed_tool(name))
             .collect();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(ListToolsResult {
@@ -128,7 +141,16 @@ impl ServerHandler for OrbitMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
-        if !self.exposed.contains(&name) {
+
+        // A name that was configured but excluded (unknown action, `deny`,
+        // or `ask`) gets its specific reason; anything else -- including a
+        // name never mentioned in `mcp.expose` at all -- gets the generic
+        // "not exposed" message. Both paths reject before ever touching
+        // the Action Registry.
+        if let Some(warning) = exposure::warnings_by_action(&self.exposure).get(name.as_str()) {
+            return Err(McpError::invalid_params(warning.message.clone(), None));
+        }
+        if !self.exposure.listable.contains(&name) {
             return Err(McpError::invalid_params(
                 format!("tool `{name}` is not exposed by this Orbit project"),
                 None,
@@ -162,10 +184,19 @@ mod tests {
     use rmcp::ServiceExt as ClientServiceExt;
 
     fn test_server(root: &std::path::Path, expose: Vec<&str>) -> OrbitMcpServer {
-        let config = ProjectConfig::parse(
+        test_server_with_config(
+            root,
+            expose,
             "version: 1\nproject:\n  name: demo\ncontext:\n  include:\n    - \"**/*\"\n",
         )
-        .unwrap();
+    }
+
+    fn test_server_with_config(
+        root: &std::path::Path,
+        expose: Vec<&str>,
+        yaml: &str,
+    ) -> OrbitMcpServer {
+        let config = ProjectConfig::parse(yaml).unwrap();
         let mut registry = ActionRegistry::new();
         orbit_actions::native::register_all(&mut registry).unwrap();
         let context = ActionContext {
@@ -252,5 +283,82 @@ mod tests {
         };
         assert!(text.contains("hello from orbit"));
         client.cancel().await.ok();
+    }
+
+    #[tokio::test]
+    async fn deny_permission_action_is_never_listed_over_the_real_protocol() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server_with_config(
+            &root,
+            vec!["project.search", "command.run_configured"],
+            "version: 1\nproject:\n  name: demo\ncontext:\n  include:\n    - \"**/*\"\n\
+             permissions:\n  command.run_configured: deny\n",
+        );
+        let client = connected_client(server).await;
+
+        let tools = client.list_tools(Default::default()).await.unwrap();
+        let names: Vec<_> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, vec!["project.search"]);
+
+        let err = client
+            .call_tool(CallToolRequestParams::new("command.run_configured"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deny"), "{err}");
+        client.cancel().await.ok();
+    }
+
+    #[tokio::test]
+    async fn ask_permission_action_is_never_listed_and_gives_a_specific_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // command.run_configured defaults to `ask`.
+        let server = test_server(&root, vec!["project.search", "command.run_configured"]);
+        let client = connected_client(server).await;
+
+        let tools = client.list_tools(Default::default()).await.unwrap();
+        let names: Vec<_> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, vec!["project.search"]);
+
+        let err = client
+            .call_tool(CallToolRequestParams::new("command.run_configured"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-interactive"), "{err}");
+        client.cancel().await.ok();
+    }
+
+    #[test]
+    fn unknown_exposed_action_is_surfaced_as_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(&root, vec!["project.write_file"]);
+        let warnings = server.exposure_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].issue, ExposureIssue::UnknownAction);
+    }
+
+    #[tokio::test]
+    async fn self_check_reports_the_listable_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let server = test_server(
+            &root,
+            vec![
+                "project.information",
+                "project.search",
+                "command.run_configured",
+            ],
+        );
+        let report = self_check(server).await.unwrap();
+        // command.run_configured (ask by default) must not show up.
+        assert_eq!(report.tool_count, 2);
+        assert!(
+            report
+                .tool_names
+                .contains(&"project.information".to_string())
+        );
+        assert!(report.tool_names.contains(&"project.search".to_string()));
     }
 }

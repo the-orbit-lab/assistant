@@ -8,6 +8,7 @@ members = [
     "crates/mcp-client",
     "crates/mcp-server",
     "crates/agent",
+    "crates/cli",
 ]
 
 [workspace.package]

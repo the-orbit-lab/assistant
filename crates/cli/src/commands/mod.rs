@@ -1,0 +1,10 @@
+pub mod ask;
+pub mod chat;
+pub mod doctor;
+pub mod files;
+pub mod init;
+pub mod list_commands;
+pub mod mcp_serve;
+pub mod project;
+pub mod run;
+pub mod search;

@@ -40,6 +40,10 @@ crates/
 │                actions into one registry for a session
 ├── mcp-client   Orbit as an MCP client (consumes external stdio servers)
 ├── mcp-server   Orbit as an MCP server (exposes filtered native actions)
+├── workspace    orchestration over several sibling Project Runtimes:
+│                .orbit/workspace.yaml, ProjectRegistry, the six
+│                workspace.* actions, deterministic multi-project
+│                retrieval -- see WORKSPACES.md
 └── cli          the `orbit` binary
 ```
 
@@ -58,13 +62,22 @@ agent
 mcp-server → actions (+ core)
 mcp-client → actions, project (+ core)
 
-cli → agent, mcp-server, actions, providers, project, core
+workspace → core, project, actions (+ agent's retrieval pattern, not
+            agent itself -- see below)
+
+cli → agent, mcp-server, actions, providers, project, core, workspace
 ```
 
 `orbit-actions`' public API has no MCP types in it. `orbit-agent` depends
 on `orbit-mcp-client` (to consume external servers as a session starts) but
 never on `orbit-mcp-server`. Ollama-specific wire types stay inside
 `orbit-providers::ollama` and never appear in `orbit-core` or `orbit-agent`.
+`orbit-workspace` does not depend on `orbit-agent` — it builds per-project
+`ActionContext`s and calls the shared `ActionRegistry::execute`, the same
+entry point `orbit-agent` itself uses, rather than driving an `Agent`
+instance directly. The CLI is what wires a workspace's deterministic
+retrieval output and an `Agent` together for `orbit ask`/`orbit chat` (see
+[WORKSPACES.md](WORKSPACES.md)).
 
 ## Request flow (`orbit ask`)
 
@@ -145,6 +158,35 @@ a source that wasn't actually returned by an executed action.
   works.
 
 See [MCP.md](MCP.md) for configuration and the Claude Code connection.
+
+## Workspaces: orchestration, not a merged filesystem
+
+`orbit-workspace` sits one layer above everything described so far,
+never inside it:
+
+```text
+Workspace Runtime (orbit-workspace)
+    |
+Project Registry (name/alias resolution, per-project availability)
+    |
+One or more selected Project Runtimes (each project's own ActionContext)
+    |
+Existing Action Runtime (orbit-actions, unmodified)
+```
+
+A workspace never merges sibling repositories into one filesystem root.
+Each registered project keeps its own canonical root, its own loaded
+`.orbit/project.yaml`, and its own security boundary; `orbit-workspace`'s
+six `workspace.*` actions are thin orchestrators that resolve which
+project(s) a request targets and then call the *same*
+`ActionRegistry::execute` a single-project session would, against a fresh
+`ActionContext` built from that project's own configuration — no native
+project logic is duplicated. `orbit-mcp-server` needed zero changes to
+support workspace mode: its exposure/permission machinery already only
+depends on a generic `ActionRegistry` + `ActionContext`, not on anything
+project-specific. See [WORKSPACES.md](WORKSPACES.md) for the full design:
+discovery precedence, name/alias resolution, natural-language routing,
+context budgeting, multi-project sources, and permission isolation.
 
 ## What is not built yet
 

@@ -90,6 +90,41 @@ calling it by name returns an error rather than running it. The MCP
 server reuses the exact same `ActionRegistry` and permission enforcement
 as the CLI and agent — there is no separate, weaker code path for MCP.
 
+## Workspace isolation between projects
+
+A workspace (`.orbit/workspace.yaml`, see [WORKSPACES.md](WORKSPACES.md))
+never merges sibling repositories into one filesystem root, and one
+project's permissions never authorize another:
+
+- Every `projects.<name>.path` in `workspace.yaml` is resolved with the
+  exact same `resolve_within_root` used above. A path that would resolve
+  outside the workspace root — `..` traversal, an absolute path
+  elsewhere, or a symlink escape — fails the whole workspace load
+  (`WorkspaceProjectEscapesRoot`) rather than silently registering a
+  project outside the intended tree.
+- Every `workspace.*` action resolves the target project first, then
+  delegates to *that project's own* native action (`project.read_file`,
+  `project.search`, ...) against a fresh `ActionContext` built from that
+  project's own loaded `.orbit/project.yaml`. Its own path security,
+  include/exclude rules, and permission map apply exactly as they would
+  outside any workspace — a permission granted in one project's config
+  (e.g. `docs`'s `project.search: allow`) has no effect on another
+  project (e.g. `obc`'s own, separately-configured
+  `command.run_configured: ask`).
+- `workspace.search`'s `projects` list, and every project-scoped
+  workspace action's `project` field, must name an actually-registered
+  project; an unknown name is rejected outright rather than silently
+  skipped or fuzzy-matched to something close.
+- There is no workspace-level command-execution action. Running a
+  configured command always requires resolving one specific project
+  (`orbit --project <name> run <command>`), and — unlike read-only
+  workspace commands — never falls back to `defaults.project` when no
+  project is explicitly selected.
+- Two different registered project names that resolve to the same
+  canonical directory are not treated as one project with two names: the
+  second is marked unavailable, so a request can't be routed to a project
+  identity that doesn't actually correspond to distinct state.
+
 ## Conversation memory
 
 `orbit chat` keeps history in process memory for the life of the process
@@ -107,3 +142,8 @@ session discards it.
   find `cargo`, `git`, etc. on `PATH`). Orbit never injects, forwards, or
   logs environment variable *values*; it also never lets repository
   content or model output set environment variables for a command.
+- Workspace project routing (natural-language scanning and name/alias
+  resolution, see [WORKSPACES.md](WORKSPACES.md)) is deterministic exact
+  text matching, never fuzzy or semantic — a model may suggest a project
+  in conversation, but only this application-code resolution decides
+  which project(s) a request actually touches.

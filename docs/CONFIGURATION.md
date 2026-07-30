@@ -89,3 +89,44 @@ action, not just the ones explicitly configured.
 `--model <name>` and `--ollama-endpoint <url>` override the configured
 provider settings for a single invocation without editing the file —
 useful for trying a different local model without committing to it.
+
+## Workspaces
+
+A directory of several sibling projects (e.g. a lab directory containing
+`assistant/`, `docs/`, `obc/`) adds one more file at the parent directory,
+`.orbit/workspace.yaml` — each sibling keeps its own ordinary
+`.orbit/project.yaml`, unchanged. Run `orbit workspace init` to generate
+one, or copy [`examples/workspace.yaml`](../examples/workspace.yaml). The
+JSON Schema is [`schemas/workspace.schema.json`](../schemas/workspace.schema.json),
+kept in sync with `crates/workspace/src/config.rs`.
+
+```yaml
+version: 1
+
+workspace:
+  name: Orbit Lab
+  description: "..."
+
+projects:
+  <name>:
+    path: ./relative/or/absolute/path   # must resolve inside the workspace root
+    aliases: [ ... ]                     # optional alternate names
+    description: "..."
+
+relationships:                # purely descriptive; never grants access
+  - source: <name>
+    target: <name>
+    type: documented-by
+
+defaults:
+  project: <name>              # used for safe, read-only overview requests only
+
+permissions:
+  <workspace-action-name>: allow|ask|deny   # for workspace.* actions themselves
+```
+
+Discovery, validation rules, name/alias resolution, and how a workspace
+interacts with `--project`/`--config`/`--workspace` are covered in full in
+[docs/WORKSPACES.md](WORKSPACES.md) — that document is the source of
+truth for workspace behavior; this section only covers where the config
+file lives.

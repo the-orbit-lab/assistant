@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://orbit-lab.dev/schemas/workspace.schema.json",
+  "title": "Orbit workspace configuration",
+  "description": "Schema for .orbit/workspace.yaml. Kept consistent with crates/workspace/src/config.rs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "workspace"],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Configuration schema version. Only 1 is currently supported."
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "default": "" }
+      }
+    },
+    "projects": {
+      "type": "object",
+      "description": "Map of registered project name to its location and identity. Each entry is a normal, independent Orbit project with its own .orbit/project.yaml.",
+      "default": {},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Workspace-relative (or absolute) filesystem path to the project. Must resolve inside the workspace root -- a `..` escape, an absolute path elsewhere, or a symlink escape fails the whole workspace load."
+          },
+          "aliases": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "default": [],
+            "description": "Alternate names this project can be resolved by. Must not collide with another project's name or another project's alias."
+          },
+          "description": { "type": "string", "default": "" }
+        }
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "description": "Directional, purely descriptive relationships between registered projects. Never used to grant or infer access between projects.",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "target", "type"],
+        "properties": {
+          "source": { "type": "string", "minLength": 1, "description": "Must name a registered project." },
+          "target": { "type": "string", "minLength": 1, "description": "Must name a registered project." },
+          "type": { "type": "string", "minLength": 1, "description": "e.g. documented-by, depends-on." }
+        }
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project": {
+          "type": "string",
+          "description": "Used for safe, read-only overview questions and single-project commands issued at the workspace root with nothing else selected. Must name a registered project. Never used for commands that change anything (e.g. `orbit run`), which always require an explicit --project."
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "description": "Permissions for the workspace.* actions themselves (distinct from each project's own `permissions`, which always still governs the per-project native action a workspace action delegates to). Every workspace.* action defaults to allow.",
+      "default": {},
+      "additionalProperties": { "enum": ["allow", "ask", "deny"] }
+    }
+  }
+}

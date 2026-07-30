@@ -1,12 +1,14 @@
 # Orbit
 
-Orbit is a local-first AI engineering assistant. It understands a single
-project at a time — its documentation, source code, configuration, and
-configured commands — and answers questions grounded in that project's
-own files, with sources shown for every claim. It is not a chatbot
-wrapper: reliable operations (file access, search, running a build) are
-implemented as deterministic, permission-checked actions, not left to the
-model's judgment.
+Orbit is a local-first AI engineering assistant. It understands a project
+— its documentation, source code, configuration, and configured commands
+— and answers questions grounded in that project's own files, with
+sources shown for every claim. It is not a chatbot wrapper: reliable
+operations (file access, search, running a build) are implemented as
+deterministic, permission-checked actions, not left to the model's
+judgment. Orbit also understands **workspaces**: a directory of several
+sibling repositories, each still resolved and secured as its own
+independent project — see [docs/WORKSPACES.md](docs/WORKSPACES.md).
 
 Orbit is both:
 
@@ -76,22 +78,36 @@ orbit ask "What does this project do?"
 | `orbit run <name>` | Run one configured command (permission-checked). |
 | `orbit doctor` | Check config, Ollama connectivity, model availability, file discovery, MCP exposure and server initialization. |
 | `orbit chat` | Multi-turn session; history lives in memory only. |
-| `orbit mcp serve` | Serve this project's exposed actions over MCP stdio. |
+| `orbit mcp serve` | Serve this project's (or, with `--workspace`, workspace's) exposed actions over MCP stdio. |
+| `orbit workspace` | Show workspace info; `orbit workspace init` to create one. |
+| `orbit projects` | List every project registered in the active workspace. |
 
-Global flags: `--project <dir>`, `--config <path>`, `--json`, `--model
-<name>`, `--ollama-endpoint <url>`, `--yes` (approve `ask`-permission
-actions non-interactively), `--verbose` (log resolved project root/config,
-discovered-file counts, tools offered to the model, tool calls it made,
-and action results to stderr — never file contents or secrets; `RUST_LOG`
-overrides it with full `tracing` filter syntax). Exit code `2` means "no
-project configuration found"; `1` is a general error; `0` is success.
+Global flags: `--project <name-or-dir>` (a registered project name/alias
+when a workspace is active, or always a filesystem path), `--workspace
+<dir>`, `--config <path>`, `--json`, `--model <name>`, `--ollama-endpoint
+<url>`, `--yes` (approve `ask`-permission actions non-interactively),
+`--verbose` (log resolved project root/config, discovered-file counts,
+tools offered to the model, tool calls it made, and action results to
+stderr — never file contents or secrets; `RUST_LOG` overrides it with
+full `tracing` filter syntax). Exit code `2` means "no project
+configuration found"; `1` is a general error; `0` is success.
 
 ```bash
 orbit search "watchdog"
 orbit ask "Why was the ESP32-C3 selected?"
 orbit run test --yes
 orbit --json project
+
+# Multiple sibling repositories registered under one workspace:
+orbit workspace
+orbit --project obc project
+orbit search "STM32" --projects docs,obc
+orbit ask "Compare the documented STM32 decision with the OBC implementation."
 ```
+
+See [docs/WORKSPACES.md](docs/WORKSPACES.md) for directory layout,
+`.orbit/workspace.yaml`, discovery precedence, natural-language project
+routing, permission isolation between projects, and workspace MCP mode.
 
 ## MCP
 
@@ -102,6 +118,8 @@ orbit mcp serve --project /path/to/project
 exposes whatever `mcp.expose` lists in that project's config to any MCP
 host over stdio — see [docs/MCP.md](docs/MCP.md) for the Claude Code
 connection config and how Orbit consumes *other* MCP servers as a client.
+`orbit --workspace /path/to/orbit-lab mcp serve` exposes the six
+`workspace.*` actions instead — see [docs/WORKSPACES.md](docs/WORKSPACES.md#mcp-workspace-mode).
 
 ## Configuration
 
@@ -111,7 +129,10 @@ provider settings, and MCP export/consumption config. See
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md),
 [examples/project.yaml](examples/project.yaml),
 [examples/mcp-project.yaml](examples/mcp-project.yaml), and the JSON
-Schema at [schemas/project.schema.json](schemas/project.schema.json).
+Schema at [schemas/project.schema.json](schemas/project.schema.json). A
+workspace of several projects adds one more file, `.orbit/workspace.yaml`
+— see [examples/workspace.yaml](examples/workspace.yaml) and
+[schemas/workspace.schema.json](schemas/workspace.schema.json).
 
 ## Security model
 
@@ -131,6 +152,9 @@ details in [docs/SECURITY.md](docs/SECURITY.md).
 - `orbit chat` history is in-process only; nothing is persisted to disk.
 - Local search is filename/heading/content matching with simple ranking —
   no embeddings, no vector database.
+- Workspace project routing (both natural-language scanning and
+  name/alias resolution) is deterministic text matching, not semantic —
+  see [docs/WORKSPACES.md](docs/WORKSPACES.md#known-limitations).
 
 ## Development
 

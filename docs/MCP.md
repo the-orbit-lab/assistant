@@ -101,6 +101,56 @@ client — `crates/cli/tests/mcp_protocol.rs` does exactly this against a
 real `orbit mcp serve` subprocess and is a working reference for the
 message shapes.
 
+## As a server: workspace mode
+
+```bash
+orbit --workspace /path/to/orbit-lab mcp serve
+```
+
+exposes **exactly the six `workspace.*` actions**
+(`workspace.information`, `workspace.list_projects`,
+`workspace.project_information`, `workspace.search`,
+`workspace.read_file`, `workspace.list_project_files`) —
+never one dynamically generated tool per registered repository, and never
+a project's own native command-execution actions. This is the same
+`OrbitMcpServer`, the same `compute_exposure`, and the same `self_check`
+as single-project mode, pointed at a workspace-scoped `ActionRegistry`
+and a synthetic workspace-level `ActionContext` instead of one project's —
+workspace mode required zero changes to this crate. Tool call results
+(e.g. `workspace.search`) carry the same project-scoped, structured
+`sources` payload described in [WORKSPACES.md](WORKSPACES.md), so a host
+can tell which registered project each result came from.
+
+**Claude Code, single-project mode** (unchanged):
+
+```json
+{
+  "mcpServers": {
+    "orbit": {
+      "command": "/absolute/path/to/orbit",
+      "args": ["--project", "/absolute/path/to/obc", "mcp", "serve"]
+    }
+  }
+}
+```
+
+**Claude Code, workspace mode:**
+
+```json
+{
+  "mcpServers": {
+    "orbit-workspace": {
+      "command": "/absolute/path/to/orbit",
+      "args": ["--workspace", "/absolute/path/to/orbit-lab", "mcp", "serve"]
+    }
+  }
+}
+```
+
+Both forms use the same binary and the same `mcpServers` shape — only the
+flag changes. See [WORKSPACES.md](WORKSPACES.md#mcp-workspace-mode) for
+the full workspace design.
+
 ## As a client: consuming other MCP servers
 
 ```yaml
@@ -151,6 +201,14 @@ Checks, in addition to the project/Ollama checks in [OLLAMA.md](OLLAMA.md):
   integration tests below, which read every line of a real subprocess's
   stdout and fail if any of it isn't valid JSON-RPC.
 
+In workspace mode, `orbit doctor` additionally reports `workspace action
+registry` (the workspace `ActionRegistry` builds cleanly), `workspace mcp
+exposure` (the six exposed action names), and `workspace mcp self-check`
+(a real `initialize` + `tools/list` round trip against a workspace-scoped
+`OrbitMcpServer`, reusing `self_check` exactly as above) — see
+[WORKSPACES.md](WORKSPACES.md#diagnostics-orbit-doctor) for the full
+per-project diagnostic format.
+
 ## Status and limitations
 
 - Transport: `stdio` only, both directions. Streamable HTTP is not wired
@@ -171,6 +229,13 @@ Checks, in addition to the project/Ollama checks in [OLLAMA.md](OLLAMA.md):
   Every line read from stdout is asserted to be valid JSON: this is what
   actually proves the protocol channel is never polluted by a stray
   `println!`, not just that the code looks like it wouldn't do that.
+- `crates/cli/tests/workspace_mcp_protocol.rs`: the same real-subprocess
+  approach against `orbit --workspace <dir> mcp serve` — asserts exactly
+  the six `workspace.*` tools are listed (never one per repository),
+  that `workspace.search` results carry correct per-project attribution
+  and never cross-attribute a match to the wrong project, that
+  `workspace.read_file` can't escape into a sibling project, and that an
+  unregistered project name is rejected over the wire.
 - `crates/mcp-server` unit/protocol tests spin up the real server against
   a real client over an in-process `tokio::io::duplex` pipe — genuine
   `initialize`/`tools/list`/`tools/call` round trips, not hand-built

@@ -9,6 +9,7 @@ members = [
     "crates/mcp-server",
     "crates/agent",
     "crates/workspace",
+    "crates/session",
     "crates/cli",
 ]
 
@@ -28,6 +29,7 @@ orbit-agent = { path = "crates/agent" }
 orbit-mcp-client = { path = "crates/mcp-client" }
 orbit-mcp-server = { path = "crates/mcp-server" }
 orbit-workspace = { path = "crates/workspace" }
+orbit-session = { path = "crates/session" }
 
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

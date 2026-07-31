@@ -8,7 +8,7 @@ project:
 model:
   # Orbit's first-class provider is a local Ollama instance.
   provider: ollama
-  model: qwen2.5:latest
+  model: qwen3:latest
   endpoint: http://localhost:11434
 
 context:

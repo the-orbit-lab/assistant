@@ -13,7 +13,11 @@
 //!   projects are selected -- one huge repository can't push another
 //!   project's results out of the response.
 //! - [`MAX_READ_BYTES_PER_PROJECT`] bounds a single `workspace.read_file`
-//!   call, mirroring `project.read_file`'s own cap.
+//!   call, mirroring `project.read_file`'s own cap. Retrieval reads are
+//!   truncating, so this bounds how much of a document is shown rather
+//!   than deciding whether it is shown at all -- an earlier, smaller
+//!   value silently dropped exactly the long documents a question was
+//!   most likely about.
 //! - [`MAX_TOTAL_CONTEXT_BYTES`] is a backstop across the whole response,
 //!   in case every project legitimately has a lot to say; ranking
 //!   (filename/heading matches first, see `orbit_project::search`) means
@@ -24,7 +28,7 @@
 pub const MAX_PROJECTS_PER_REQUEST: usize = 8;
 pub const MAX_RESULTS_PER_PROJECT: usize = 5;
 pub const MAX_EXCERPT_BYTES_PER_RESULT: usize = 400;
-pub const MAX_READ_BYTES_PER_PROJECT: u64 = 8_000;
+pub const MAX_READ_BYTES_PER_PROJECT: u64 = 16_000;
 pub const MAX_TOTAL_CONTEXT_BYTES: usize = 24_000;
 
 /// Truncate `s` to at most `max_bytes`, respecting UTF-8 character

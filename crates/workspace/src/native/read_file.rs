@@ -16,6 +16,8 @@ struct Input {
     path: String,
     #[serde(default)]
     max_bytes: Option<u64>,
+    #[serde(default)]
+    truncate: bool,
 }
 
 pub struct WorkspaceReadFileAction {
@@ -37,7 +39,11 @@ impl Action for WorkspaceReadFileAction {
                 "properties": {
                     "project": { "type": "string", "description": "Registered project name or alias" },
                     "path": { "type": "string", "description": "Path relative to that project's own root" },
-                    "max_bytes": { "type": "integer", "minimum": 1 }
+                    "max_bytes": { "type": "integer", "minimum": 1 },
+                    "truncate": {
+                        "type": "boolean",
+                        "description": "Return the first max_bytes instead of failing when the file is larger."
+                    }
                 },
                 "required": ["project", "path"],
                 "additionalProperties": false
@@ -78,7 +84,11 @@ impl Action for WorkspaceReadFileAction {
             .call_project_action(
                 entry,
                 read_file::NAME,
-                json!({ "path": parsed.path, "max_bytes": max_bytes }),
+                json!({
+                    "path": parsed.path,
+                    "max_bytes": max_bytes,
+                    "truncate": parsed.truncate,
+                }),
             )
             .await?;
 
@@ -97,6 +107,7 @@ impl Action for WorkspaceReadFileAction {
             "project": entry.name,
             "path": output.data["path"],
             "size": output.data["size"],
+            "truncated": output.data["truncated"],
             "content": output.data["content"],
             "sources": workspace_sources,
         }))

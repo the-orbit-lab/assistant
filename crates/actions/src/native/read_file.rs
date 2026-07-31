@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use orbit_core::{
     ActionDescriptor, ActionInput, ActionOutput, OrbitError, Permission, SourceReference,
 };
-use orbit_project::read_allowed_file;
+use orbit_project::{read_allowed_file, read_allowed_file_truncated};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -22,6 +22,11 @@ struct ReadFileInput {
     path: String,
     #[serde(default)]
     max_bytes: Option<u64>,
+    /// Return the first `max_bytes` of an oversized file instead of
+    /// failing. Off by default, so existing callers keep the strict
+    /// behavior they rely on.
+    #[serde(default)]
+    truncate: bool,
 }
 
 pub struct ReadFileAction;
@@ -36,7 +41,11 @@ impl Action for ReadFileAction {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path relative to the project root" },
-                    "max_bytes": { "type": "integer", "minimum": 1 }
+                    "max_bytes": { "type": "integer", "minimum": 1 },
+                    "truncate": {
+                        "type": "boolean",
+                        "description": "Return the first max_bytes instead of failing when the file is larger."
+                    }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -72,13 +81,28 @@ impl Action for ReadFileAction {
             .min(MAX_ALLOWED_READ_BYTES);
 
         let relative = PathBuf::from(&parsed.path);
-        let content = read_allowed_file(&ctx.root, &ctx.config, &relative, limit)?;
+        let (content, truncated) = if parsed.truncate {
+            read_allowed_file_truncated(&ctx.root, &ctx.config, &relative, limit)?
+        } else {
+            (
+                read_allowed_file(&ctx.root, &ctx.config, &relative, limit)?,
+                false,
+            )
+        };
         // Never log file content -- only that a read happened and its size.
-        tracing::debug!(path = %parsed.path, bytes = content.len(), "project.read_file executed");
+        tracing::debug!(
+            path = %parsed.path,
+            bytes = content.len(),
+            truncated,
+            "project.read_file executed"
+        );
 
         Ok(ActionOutput::new(json!({
             "path": parsed.path,
             "size": content.len(),
+            // Stated explicitly so the model knows it is seeing part of a
+            // file rather than all of it.
+            "truncated": truncated,
             "content": content,
         }))
         .with_sources(vec![SourceReference::whole_file(relative)]))

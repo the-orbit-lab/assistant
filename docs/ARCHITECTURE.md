@@ -33,7 +33,8 @@ crates/
 ├── core         shared types: messages, model requests/responses, actions,
 │                permissions, sources, execution records, errors
 ├── project      .orbit/project.yaml, root discovery, path/exclude
-│                security, file discovery, deterministic search
+│                security, file discovery, tokenization, query
+│                analysis, and deterministic lexical search
 ├── actions      Action trait + ActionRegistry + the six native actions
 ├── providers    ModelProvider trait, Ollama provider, mock provider
 ├── agent        the tool-calling loop; merges native + external-MCP
@@ -113,7 +114,11 @@ validation, then permission enforcement (`allow`/`ask`/`deny`), then
 execution, then an `ExecutionRecord`. The model can request an action; it
 can never grant itself permission to run one.
 
-### Deterministic retrieval for broad questions
+See [SEARCH.md](SEARCH.md) for the retrieval pipeline: tokenization,
+query analysis, BM25 ranking, conversational topic state, progressive
+file reads, and the grounding policy.
+
+### Deterministic retrieval
 
 A small local model does not reliably decide, on its own, to call the
 right tools for a vague question like "What does this repository do?" —

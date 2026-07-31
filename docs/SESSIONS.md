@@ -193,6 +193,12 @@ this version deliberately does not introduce uncontrolled concurrency.
 The bridge does run each turn on its own task, so `execution.cancel` and
 `permission.resolve` can be processed while a turn is in flight.
 
+## Topic state
+
+A session tracks what the conversation is about, so a follow-up that does
+not name its subject can still be retrieved on. See
+[SEARCH.md](SEARCH.md#conversational-context-orbit-sessiontopic).
+
 ## Known limitations
 
 - In-memory only: closing the process discards the conversation.

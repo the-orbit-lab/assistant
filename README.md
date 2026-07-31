@@ -74,7 +74,7 @@ orbit ask "What does this project do?"
 | `orbit init` | Create `.orbit/project.yaml` (`--force` to overwrite). |
 | `orbit project` | Show name, root, provider, commands, effective permissions, MCP config. |
 | `orbit files` | List every file the config allows Orbit to see. |
-| `orbit search <query>` | Deterministic local search — no model involved. |
+| `orbit search <query>` | Deterministic local lexical search (BM25) — no model involved. `--verbose` explains the ranking. |
 | `orbit ask <question>` | One agent turn: model + tools, answer + sources. |
 | `orbit commands` | List configured commands and their required permission. |
 | `orbit run <name>` | Run one configured command (permission-checked). |
@@ -194,8 +194,10 @@ details in [docs/SECURITY.md](docs/SECURITY.md).
 - Duplicate YAML mapping keys in `.orbit/project.yaml` are not detected as
   a config error (standard YAML last-value-wins behavior).
 - `orbit chat` history is in-process only; nothing is persisted to disk.
-- Local search is filename/heading/content matching with simple ranking —
-  no embeddings, no vector database.
+- Search is deterministic lexical ranking (BM25 over normalized tokens,
+  with filename/path/heading/symbol signals) — no embeddings, no vector
+  database, and no semantic matching. See
+  [docs/SEARCH.md](docs/SEARCH.md#known-limitations).
 - Workspace project routing (both natural-language scanning and
   name/alias resolution) is deterministic text matching, not semantic —
   see [docs/WORKSPACES.md](docs/WORKSPACES.md#known-limitations).

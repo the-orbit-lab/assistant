@@ -30,6 +30,11 @@ pub async fn run(global: &GlobalArgs, args: SearchArgs) -> Result<(), OrbitError
         .as_array()
         .cloned()
         .unwrap_or_default();
+
+    if global.verbose {
+        print_query_debug(&args.query, &output.data, &[]);
+    }
+
     if results.is_empty() {
         println!("No results for `{}`.", args.query);
         return Ok(());
@@ -47,9 +52,63 @@ pub async fn run(global: &GlobalArgs, args: SearchArgs) -> Result<(), OrbitError
             None => println!("{location}"),
         }
         println!("    {}", entry["excerpt"].as_str().unwrap_or_default());
+        if global.verbose {
+            print_score_breakdown(entry);
+        }
     }
     println!("\n{} result(s)", results.len());
     Ok(())
+}
+
+/// Explain how a query was interpreted, on stderr so `--json` and piped
+/// stdout stay machine-readable.
+///
+/// Structural information only: the terms searched for and why each
+/// result ranked where it did. No file content is printed beyond the
+/// excerpts the search already returns, and nothing here can reach an
+/// excluded file, because it only reports on results the action produced.
+fn print_query_debug(raw_query: &str, data: &serde_json::Value, context_terms: &[String]) {
+    let terms: Vec<String> = data["terms"]
+        .as_array()
+        .map(|t| {
+            t.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!("query:            {raw_query}");
+    eprintln!("normalized query: {}", terms.join(" "));
+    eprintln!("extracted tokens: {terms:?}");
+    if !context_terms.is_empty() {
+        eprintln!("context tokens:   {context_terms:?}");
+    }
+    eprintln!("results:          {}", data["count"]);
+}
+
+fn print_score_breakdown(entry: &serde_json::Value) {
+    let components = &entry["score_components"];
+    let number = |key: &str| components[key].as_f64().unwrap_or_default();
+    let matched: Vec<String> = components["matched_terms"]
+        .as_array()
+        .map(|t| {
+            t.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    eprintln!(
+        "      score={} lexical={:.2} coverage={:.2} filename={:.2} path={:.2} \
+         heading={:.0} symbol={:.2} phrase={:.2} matched={:?}",
+        entry["score"].as_u64().unwrap_or_default(),
+        number("lexical"),
+        number("coverage"),
+        number("filename"),
+        number("path"),
+        number("heading"),
+        number("symbol"),
+        number("phrase"),
+        matched,
+    );
 }
 
 async fn run_multi_project(global: &GlobalArgs, args: SearchArgs) -> Result<(), OrbitError> {

@@ -109,6 +109,9 @@ async fn run_workspace(
         question,
         explicit_projects.as_deref(),
         &mut history,
+        // `orbit ask` is a one-shot command with no event consumer; a
+        // null emitter keeps the retrieval path identical either way.
+        &orbit_core::EventEmitter::null(),
     )
     .await;
 

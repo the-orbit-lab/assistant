@@ -16,7 +16,10 @@
 use std::collections::HashSet;
 
 use orbit_actions::{ActionContext, ActionRegistry};
-use orbit_core::{ConfirmationProvider, ExecutionRecord, Message, SourceReference, ToolCall};
+use orbit_core::{
+    ConfirmationProvider, EventEmitter, EventPayload, ExecutionRecord, Message, SourceReference,
+    ToolCall,
+};
 use serde_json::{Value, json};
 
 use crate::budget::MAX_PROJECTS_PER_REQUEST;
@@ -245,6 +248,7 @@ const OVERVIEW_READ_BYTES: u64 = 8_000;
 /// to `history` exactly as a model-initiated call would produce -- through
 /// the same `ActionRegistry::execute`, so permission enforcement and
 /// execution records are identical either way.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     registry: &ActionRegistry,
     action_ctx: &ActionContext,
@@ -253,11 +257,16 @@ pub async fn run(
     question: &str,
     explicit_projects: Option<&[String]>,
     history: &mut Vec<Message>,
+    events: &EventEmitter,
 ) -> (ResolvedScope, Vec<SourceReference>, Vec<ExecutionRecord>) {
     let scope = resolve_scope(question, explicit_projects, project_registry);
     let mut sources = Vec::new();
     let mut records = Vec::new();
     let mut next_call_id = 0u32;
+
+    events.emit(EventPayload::RetrievalStarted {
+        scope: scope.projects.clone(),
+    });
 
     if scope.projects.is_empty() {
         call(
@@ -270,6 +279,7 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
         call(
@@ -282,8 +292,14 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
+        events.emit(EventPayload::RetrievalCompleted {
+            scope: scope.projects.clone(),
+            action_count: records.len(),
+            source_count: sources.len(),
+        });
         return (scope, sources, records);
     }
 
@@ -305,6 +321,7 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
     }
@@ -321,11 +338,14 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
     } else {
         for project in &bounded_scope {
-            for path in overview_candidates(registry, action_ctx, confirmation, project).await {
+            for path in
+                overview_candidates(registry, action_ctx, confirmation, project, events).await
+            {
                 call(
                     registry,
                     action_ctx,
@@ -336,11 +356,18 @@ pub async fn run(
                     &mut sources,
                     &mut records,
                     &mut next_call_id,
+                    events,
                 )
                 .await;
             }
         }
     }
+
+    events.emit(EventPayload::RetrievalCompleted {
+        scope: scope.projects.clone(),
+        action_count: records.len(),
+        source_count: sources.len(),
+    });
 
     (scope, sources, records)
 }
@@ -350,13 +377,16 @@ async fn overview_candidates(
     action_ctx: &ActionContext,
     confirmation: &dyn ConfirmationProvider,
     project: &str,
+    events: &EventEmitter,
 ) -> Vec<String> {
     let (_, result) = registry
-        .execute(
+        .execute_observed(
             action_ctx,
             "workspace.list_project_files",
             orbit_core::ActionInput(json!({ "project": project })),
             confirmation,
+            events,
+            &events.next_execution_id(),
         )
         .await;
     let Ok(output) = result else {
@@ -390,13 +420,16 @@ async fn call(
     sources: &mut Vec<SourceReference>,
     records: &mut Vec<ExecutionRecord>,
     next_call_id: &mut u32,
+    events: &EventEmitter,
 ) {
     let (record, result) = registry
-        .execute(
+        .execute_observed(
             action_ctx,
             name,
             orbit_core::ActionInput(arguments.clone()),
             confirmation,
+            events,
+            &events.next_execution_id(),
         )
         .await;
     records.push(record);
@@ -570,6 +603,7 @@ mod tests {
             "What does the OBC project do?",
             None,
             &mut history,
+            &orbit_core::EventEmitter::null(),
         )
         .await;
 
@@ -608,6 +642,7 @@ mod tests {
             "Compare docs and OBC regarding STM32 selection",
             None,
             &mut history,
+            &orbit_core::EventEmitter::null(),
         )
         .await;
 
@@ -646,6 +681,7 @@ mod tests {
             "What projects are available?",
             None,
             &mut history,
+            &orbit_core::EventEmitter::null(),
         )
         .await;
 

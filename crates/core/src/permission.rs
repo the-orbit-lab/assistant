@@ -29,10 +29,26 @@ impl std::fmt::Display for Permission {
 
 /// A request to confirm a single `ask`-permission action, handed to whatever
 /// front end (CLI prompt, MCP host, future GUI) is driving the session.
+///
+/// `project` and `arguments_summary` exist so a front end can show *what*
+/// is about to happen and *where*, not just which action was named.
+/// `arguments_summary` is produced by
+/// [`crate::event::summarize_arguments`]: secret-shaped values are
+/// redacted and absolute paths shortened, so it is safe to display and
+/// log. The action itself always receives the original, unmodified input.
 #[derive(Debug, Clone)]
 pub struct ConfirmationRequest {
+    /// Correlates this request with the
+    /// [`crate::event::EventPayload::PermissionRequired`] event the Action
+    /// Runtime emits for it, and with the decision that answers it. A
+    /// front end that resolves permissions asynchronously (the JSONL
+    /// bridge, a future GUI) keys its pending-request table on this.
+    pub request_id: crate::event::PermissionRequestId,
     pub action: String,
     pub description: String,
+    /// The project the action will run against, when one is known.
+    pub project: Option<String>,
+    pub arguments_summary: String,
 }
 
 /// How permission was resolved for a single execution attempt.
@@ -50,18 +66,28 @@ pub enum PermissionOutcome {
 /// Resolves `ask` permissions at execution time.
 ///
 /// Implementations decide how confirmation is obtained: an interactive CLI
-/// prompt, an automatic denial in non-interactive mode, or a pre-supplied
-/// approval list. The Action Runtime never assumes a particular UI.
+/// prompt, an automatic denial in non-interactive mode, a pre-supplied
+/// approval flag, or — for a session driven by an external UI — waiting
+/// for a structured decision to arrive over a protocol. The Action Runtime
+/// never assumes a particular front end.
+///
+/// This is `async` because obtaining a decision genuinely is: a session
+/// must be able to *pause* an action, emit
+/// [`crate::event::EventPayload::PermissionRequired`], and resume only
+/// once a real approval or denial arrives, without blocking the runtime
+/// thread that the rest of the session is running on.
+#[async_trait::async_trait]
 pub trait ConfirmationProvider: Send + Sync {
-    fn confirm(&self, request: &ConfirmationRequest) -> bool;
+    async fn confirm(&self, request: &ConfirmationRequest) -> bool;
 }
 
 /// Always denies `ask` permissions. Safe default for non-interactive
 /// contexts (e.g. the MCP server) that supplied no explicit approval.
 pub struct AlwaysDeny;
 
+#[async_trait::async_trait]
 impl ConfirmationProvider for AlwaysDeny {
-    fn confirm(&self, _request: &ConfirmationRequest) -> bool {
+    async fn confirm(&self, _request: &ConfirmationRequest) -> bool {
         false
     }
 }
@@ -71,8 +97,9 @@ impl ConfirmationProvider for AlwaysDeny {
 /// silent default.
 pub struct AlwaysAllow;
 
+#[async_trait::async_trait]
 impl ConfirmationProvider for AlwaysAllow {
-    fn confirm(&self, _request: &ConfirmationRequest) -> bool {
+    async fn confirm(&self, _request: &ConfirmationRequest) -> bool {
         true
     }
 }

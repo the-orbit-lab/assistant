@@ -214,7 +214,7 @@ impl ProjectRegistry {
                 version: 1,
                 project: orbit_project::ProjectMeta {
                     name: self.config.workspace.name.clone(),
-                    project_type: "workspace".to_string(),
+                    project_type: orbit_project::config::WORKSPACE_PROJECT_TYPE.to_string(),
                     description: self.config.workspace.description.clone(),
                 },
                 model: orbit_project::ModelConfig::default(),

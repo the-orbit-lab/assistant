@@ -4,6 +4,7 @@
 
 pub mod action;
 pub mod error;
+pub mod event;
 pub mod execution;
 pub mod message;
 pub mod model;
@@ -13,6 +14,11 @@ pub mod source;
 
 pub use action::{ActionDescriptor, ActionInput, ActionOutput};
 pub use error::{OrbitError, ProviderError, Result};
+pub use event::{
+    AgentEvent, CancellationToken, CollectingSink, EVENT_PROTOCOL_VERSION, EventEmitter,
+    EventPayload, EventSink, ExecutionId, NullSink, PermissionDecision, PermissionRequestId,
+    SessionId, SessionMode, TurnId, summarize_arguments,
+};
 pub use execution::ExecutionRecord;
 pub use message::{Message, Role, ToolCall};
 pub use model::{FinishReason, ModelRequest, ModelResponse, ToolDefinition};

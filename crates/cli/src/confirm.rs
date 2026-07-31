@@ -5,12 +5,19 @@ use orbit_core::{AlwaysAllow, AlwaysDeny, ConfirmationProvider, ConfirmationRequ
 
 struct InteractivePrompt;
 
+#[async_trait::async_trait]
 impl ConfirmationProvider for InteractivePrompt {
-    fn confirm(&self, request: &ConfirmationRequest) -> bool {
-        eprint!(
-            "\nAction `{}` requires confirmation: {}\nAllow? [y/N] ",
-            request.action, request.description
-        );
+    async fn confirm(&self, request: &ConfirmationRequest) -> bool {
+        // Blocking on stdin is the intended behavior here: this is a
+        // one-user interactive prompt, and nothing else should proceed
+        // until the user answers.
+        eprintln!("\nAction `{}` requires confirmation.", request.action);
+        if let Some(project) = &request.project {
+            eprintln!("  Project:   {project}");
+        }
+        eprintln!("  Action:    {}", request.description);
+        eprintln!("  Arguments: {}", request.arguments_summary);
+        eprint!("Allow? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {

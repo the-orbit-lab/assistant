@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
+
+/// `project.type` of the synthetic context that represents a *workspace*
+/// rather than a project (see
+/// `orbit_workspace::ProjectRegistry::workspace_action_context`).
+///
+/// A workspace is not a project: code that reports "which project is this"
+/// must not report the workspace's name as one. Named here so the producer
+/// and the consumers of that marker stay in sync.
+pub const WORKSPACE_PROJECT_TYPE: &str = "workspace";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen2.5:latest";
 
 /// Exclude patterns applied regardless of what the project configures.

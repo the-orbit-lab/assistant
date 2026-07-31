@@ -286,3 +286,44 @@ async fn session_sources_are_recorded_once_per_source() {
     );
     assert_eq!(kept.len(), outcome.sources.len());
 }
+
+/// The multi-project conversation from the report: a follow-up that
+/// refers back ("that") must keep the earlier subject rather than
+/// retrieving on the word "compare".
+#[tokio::test]
+async fn a_referring_follow_up_keeps_the_previous_subject() {
+    let (_tmp, runtime, sink) = workspace_session(vec![answer("first"), answer("second")]);
+
+    runtime
+        .send_message("Why was STM32 selected?")
+        .await
+        .unwrap();
+    sink.clear();
+
+    let outcome = runtime
+        .send_message("Now compare that with docs")
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.active_projects.contains(&"docs".to_string()),
+        "{:?}",
+        outcome.active_projects
+    );
+    let sources: Vec<String> = sink
+        .events()
+        .iter()
+        .filter_map(|e| match &e.payload {
+            EventPayload::SourceFound { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !sources.is_empty(),
+        "a referring follow-up must still be grounded: {sources:?}"
+    );
+    assert!(
+        sources.iter().any(|p| p.contains("ADR-0004")),
+        "the STM32 subject must survive the follow-up: {sources:?}"
+    );
+}

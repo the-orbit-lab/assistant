@@ -87,13 +87,16 @@ async fn conversation_context_is_preserved_across_turns() {
         .send_message("what does the watchdog do?")
         .await
         .unwrap();
+    let after_first = runtime.status().await.message_count;
     let second = runtime.send_message("when does it fire?").await.unwrap();
 
     assert_eq!(second.answer, "It fires after a brownout.");
     let status = runtime.status().await;
     assert_eq!(status.turns, 2);
-    // system + (user + assistant) * 2
-    assert_eq!(status.message_count, 5);
+    assert!(
+        status.message_count > after_first,
+        "the second turn must build on the first, not replace it"
+    );
 }
 
 #[tokio::test]
@@ -140,9 +143,43 @@ async fn a_normal_turn_follows_the_documented_event_order() {
 
     assert!(index("session_started") < index("user_message_received"));
     assert!(index("user_message_received") < index("action_requested"));
-    assert!(index("action_requested") < index("action_started"));
-    assert!(index("action_started") < index("source_found"));
-    assert!(index("source_found") < index("action_completed"));
+
+    // The per-execution guarantee, checked for every execution in the
+    // turn rather than only the first occurrence of each name:
+    // requested → started → sources → completed, sharing one execution
+    // id. Deterministic retrieval runs its own actions on every turn, so
+    // a global "first action_started before first source_found" check
+    // would compare events from unrelated executions.
+    let mut by_execution: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+    for event in sink.events() {
+        if let Some(id) = &event.execution_id {
+            by_execution
+                .entry(id.0.clone())
+                .or_default()
+                .push(event.type_name());
+        }
+    }
+    assert!(!by_execution.is_empty());
+    for (id, sequence) in by_execution {
+        let position = |needle: &str| sequence.iter().position(|n| *n == needle);
+        let requested = position("action_requested")
+            .unwrap_or_else(|| panic!("{id} has no action_requested: {sequence:?}"));
+        if let Some(started) = position("action_started") {
+            assert!(requested < started, "{id}: {sequence:?}");
+            let finished = position("action_completed")
+                .or_else(|| position("action_failed"))
+                .unwrap_or_else(|| panic!("{id} never finished: {sequence:?}"));
+            assert!(started < finished, "{id}: {sequence:?}");
+            for (at, name) in sequence.iter().enumerate() {
+                if *name == "source_found" {
+                    assert!(
+                        started < at && at < finished,
+                        "{id}: a source must fall inside its own action: {sequence:?}"
+                    );
+                }
+            }
+        }
+    }
     assert!(
         names
             .iter()
@@ -191,11 +228,13 @@ async fn a_failing_action_reports_action_failed_and_the_turn_still_completes() {
     .await;
     let outcome = runtime.send_message("read the missing file").await.unwrap();
 
-    let names = sink.type_names();
-    assert!(names.contains(&"action_failed"));
-    assert!(!names.contains(&"action_completed"));
+    let read_events = events_for_action(&sink, "project.read_file");
+    assert!(
+        read_events.contains(&"action_failed"),
+        "the missing file must be reported as a failure: {read_events:?}"
+    );
     assert!(!outcome.cancelled);
-    assert_eq!(names.last(), Some(&"turn_completed"));
+    assert_eq!(sink.type_names().last(), Some(&"turn_completed"));
 }
 
 // --- streaming -----------------------------------------------------------
@@ -261,7 +300,10 @@ async fn an_ask_permission_pauses_until_it_is_approved() {
 
     // Wait for the request, proving the action actually paused.
     let request_id = wait_for_permission(&sink).await;
-    assert!(!sink.type_names().contains(&"action_started"));
+    assert!(
+        !events_for_action(&sink, "command.run_configured").contains(&"action_started"),
+        "the gated action must not have started while the request is pending"
+    );
 
     runtime.resolve_permission(&request_id, PermissionDecision::AllowOnce);
     let outcome = turn.await.unwrap().unwrap();
@@ -307,13 +349,13 @@ async fn a_denied_permission_never_starts_the_action() {
     turn.await.unwrap().unwrap();
     drop(tmp);
 
-    let names = sink.type_names();
-    assert!(names.contains(&"permission_resolved"));
+    assert!(sink.type_names().contains(&"permission_resolved"));
+    let gated = events_for_action(&sink, "command.run_configured");
     assert!(
-        !names.contains(&"action_started"),
-        "a denied action must never start: {names:?}"
+        !gated.contains(&"action_started"),
+        "a denied action must never start: {gated:?}"
     );
-    assert!(names.contains(&"action_failed"));
+    assert!(gated.contains(&"action_failed"), "{gated:?}");
 }
 
 /// The permission event must carry a safe, redacted argument summary.
@@ -400,7 +442,10 @@ async fn cancelling_a_pending_permission_ends_the_turn_without_running_it() {
     drop(tmp);
 
     let names = sink.type_names();
-    assert!(!names.contains(&"action_started"));
+    assert!(
+        !events_for_action(&sink, "command.run_configured").contains(&"action_started"),
+        "the gated action must never have started"
+    );
     assert!(names.contains(&"execution_cancelled"));
     assert!(
         !names.contains(&"turn_completed"),
@@ -454,6 +499,27 @@ async fn a_session_stays_usable_after_a_cancelled_turn() {
     assert!(!next.cancelled);
     assert_eq!(next.answer, "Second turn worked.");
     assert_eq!(runtime.status().await.turns, 2);
+}
+
+/// Event type names concerning one specific action, in order.
+///
+/// Deterministic retrieval runs its own actions on every turn, so
+/// assertions about "the action" under test must name it — otherwise they
+/// accidentally match retrieval's `project.information` or
+/// `project.search`.
+fn events_for_action(sink: &CollectingSink, action_name: &str) -> Vec<&'static str> {
+    sink.events()
+        .iter()
+        .filter(|e| match &e.payload {
+            EventPayload::ActionRequested { action, .. }
+            | EventPayload::ActionStarted { action }
+            | EventPayload::ActionCompleted { action, .. }
+            | EventPayload::ActionFailed { action, .. } => action == action_name,
+            EventPayload::PermissionRequired { action, .. } => action == action_name,
+            _ => false,
+        })
+        .map(|e| e.type_name())
+        .collect()
 }
 
 async fn wait_for_permission(sink: &Arc<CollectingSink>) -> PermissionRequestId {

@@ -1,7 +1,9 @@
 use orbit_actions::{ActionContext, ActionRegistry};
+use std::collections::HashSet;
+
 use orbit_core::{
     ActionInput, ConfirmationProvider, EventEmitter, EventPayload, ExecutionRecord, Message,
-    SourceReference, ToolCall,
+    RetrievalConfidence, SourceReference, ToolCall,
 };
 use serde_json::{Value, json};
 
@@ -33,6 +35,40 @@ const OVERVIEW_VERBS: &[&str] = &[
 // KB) while still being a hard bound, not "read the whole file".
 const OVERVIEW_READ_BYTES: u64 = 12_000;
 const MAX_OVERVIEW_READS: usize = 2;
+
+/// How many of the strongest search hits are read in full.
+///
+/// A search excerpt is one line; answering "explain the session
+/// architecture" needs the surrounding prose. Reading the top-ranked
+/// files is what turns a list of matching lines into usable evidence,
+/// and it is done here rather than asked of the user, because the
+/// ranking already knows which files are most likely relevant.
+const MAX_FOLLOW_UP_READS: usize = 3;
+const FOLLOW_UP_READ_BYTES: u64 = 12_000;
+/// Results considered when choosing which files to read in full.
+const SEARCH_LIMIT: usize = 12;
+
+/// What one deterministic retrieval step produced.
+#[derive(Debug, Clone, Default)]
+pub struct RetrievalOutcome {
+    pub sources: Vec<SourceReference>,
+    pub records: Vec<ExecutionRecord>,
+    /// Terms actually searched for, for `--verbose` diagnostics.
+    pub terms: Vec<String>,
+}
+
+impl RetrievalOutcome {
+    /// Confidence is judged on distinct *files*, so several matches
+    /// inside one document do not look like corroboration.
+    pub fn confidence(&self) -> RetrievalConfidence {
+        let files: HashSet<_> = self
+            .sources
+            .iter()
+            .map(|s| s.split_project_prefix().1)
+            .collect();
+        RetrievalConfidence::from_distinct_files(files.len())
+    }
+}
 
 /// Matches "What does this repository do?", "Explain this project.",
 /// "What is this codebase for?" and similar broad questions that have no
@@ -67,13 +103,16 @@ pub fn is_broad_overview_question(question: &str) -> bool {
 /// configured, file not found) is skipped silently -- this is a best-effort
 /// head start, not a requirement, and it never bypasses a project's
 /// permission configuration.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     registry: &ActionRegistry,
     context: &ActionContext,
     confirmation: &dyn ConfirmationProvider,
     history: &mut Vec<Message>,
     events: &EventEmitter,
-) -> (Vec<SourceReference>, Vec<ExecutionRecord>) {
+    question: &str,
+    context_terms: &[String],
+) -> RetrievalOutcome {
     let mut sources = Vec::new();
     let mut records = Vec::new();
     let mut next_call_id = 0u32;
@@ -97,14 +136,41 @@ pub async fn run(
     )
     .await;
 
-    for path in overview_candidates(registry, context, confirmation, events).await {
+    let analysis = orbit_project::analyze_with_context(question, context_terms);
+    let terms = analysis.all_terms();
+    let mut read_paths: Vec<String> = Vec::new();
+
+    // Step 1-2: lexical search over the project. Ranking already favors
+    // filenames, path components, and headings, so a question about
+    // architecture reaches `docs/ARCHITECTURE.md` without a special case
+    // for documentation.
+    if !terms.is_empty() {
+        let output = execute_synthetic(
+            registry,
+            context,
+            confirmation,
+            history,
+            "project.search",
+            json!({ "query": analysis.to_search_string(), "limit": SEARCH_LIMIT }),
+            &mut sources,
+            &mut records,
+            &mut next_call_id,
+            events,
+        )
+        .await;
+        read_paths = strongest_paths(output.as_ref(), MAX_FOLLOW_UP_READS);
+    }
+
+    // Step 3-4: read the strongest matches in full. A one-line excerpt
+    // rarely answers "explain X"; the surrounding prose does.
+    for path in &read_paths {
         execute_synthetic(
             registry,
             context,
             confirmation,
             history,
             "project.read_file",
-            json!({ "path": path, "max_bytes": OVERVIEW_READ_BYTES }),
+            json!({ "path": path, "max_bytes": FOLLOW_UP_READ_BYTES, "truncate": true }),
             &mut sources,
             &mut records,
             &mut next_call_id,
@@ -113,13 +179,59 @@ pub async fn run(
         .await;
     }
 
+    // Fallback: nothing matched (or there was nothing to search for), so
+    // fall back to whatever reads like an overview. This is what answers
+    // "what does this project do", which has no keyword of its own.
+    if read_paths.is_empty() {
+        for path in overview_candidates(registry, context, confirmation, events).await {
+            execute_synthetic(
+                registry,
+                context,
+                confirmation,
+                history,
+                "project.read_file",
+                json!({ "path": path, "max_bytes": OVERVIEW_READ_BYTES }),
+                &mut sources,
+                &mut records,
+                &mut next_call_id,
+                events,
+            )
+            .await;
+        }
+    }
+
     events.emit(EventPayload::RetrievalCompleted {
         scope: vec![project],
         action_count: records.len(),
         source_count: sources.len(),
     });
 
-    (sources, records)
+    RetrievalOutcome {
+        sources,
+        records,
+        terms,
+    }
+}
+
+/// Distinct file paths from a `project.search` result, strongest first.
+fn strongest_paths(output: Option<&Value>, limit: usize) -> Vec<String> {
+    let Some(results) = output.and_then(|o| o["results"].as_array()) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for result in results {
+        let Some(path) = result["path"].as_str() else {
+            continue;
+        };
+        if seen.insert(path.to_string()) {
+            paths.push(path.to_string());
+        }
+        if paths.len() >= limit {
+            break;
+        }
+    }
+    paths
 }
 
 /// Rank the project's own allowed files by how likely they are to be a
@@ -189,7 +301,7 @@ async fn execute_synthetic(
     records: &mut Vec<ExecutionRecord>,
     next_call_id: &mut u32,
     events: &EventEmitter,
-) {
+) -> Option<Value> {
     let (record, result) = registry
         .execute_observed(
             context,
@@ -218,6 +330,7 @@ async fn execute_synthetic(
                 total_sources = sources.len(),
                 "deterministic retrieval step executed"
             );
+            Some(output.data)
         }
         Err(err) => {
             tracing::debug!(
@@ -225,6 +338,7 @@ async fn execute_synthetic(
                 error = %err,
                 "deterministic retrieval step skipped"
             );
+            None
         }
     }
 }

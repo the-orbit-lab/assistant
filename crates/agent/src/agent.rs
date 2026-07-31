@@ -41,6 +41,7 @@ pub struct Agent {
     max_iterations: u32,
     request_timeout: Duration,
     builtin_overview_retrieval: bool,
+    context_terms: Vec<String>,
     events: EventEmitter,
     cancel: CancellationToken,
     streaming: bool,
@@ -61,6 +62,7 @@ impl Agent {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             builtin_overview_retrieval: true,
+            context_terms: Vec::new(),
             events: EventEmitter::null(),
             cancel: CancellationToken::new(),
             streaming: false,
@@ -102,16 +104,23 @@ impl Agent {
         self
     }
 
-    /// The single-project `project.information` -> `project.read_file`
-    /// deterministic retrieval (see `retrieval::run`) only makes sense
-    /// when this agent's registry actually has those native actions
-    /// registered. A caller driving a *workspace*-scoped registry (only
-    /// `workspace.*` actions) does its own deterministic retrieval before
-    /// the first turn and should disable this, since attempting it here
-    /// would just be silently-failing `UnknownAction` calls against
-    /// `project.information`.
-    pub fn with_builtin_overview_retrieval(mut self, enabled: bool) -> Self {
+    /// The single-project deterministic retrieval (see `retrieval::run`)
+    /// only makes sense when this agent's registry actually has the
+    /// `project.*` native actions registered. A caller driving a
+    /// *workspace*-scoped registry (only `workspace.*` actions) does its
+    /// own retrieval before the first turn and should disable this, since
+    /// attempting it here would just be silently-failing `UnknownAction`
+    /// calls against `project.information`.
+    pub fn with_builtin_retrieval(mut self, enabled: bool) -> Self {
         self.builtin_overview_retrieval = enabled;
+        self
+    }
+
+    /// Terms carried in from earlier turns, so a follow-up like "now
+    /// explain how cancellation works" retrieves against the subject
+    /// already under discussion instead of the word "cancellation" alone.
+    pub fn with_context_terms(mut self, terms: Vec<String>) -> Self {
+        self.context_terms = terms;
         self
     }
 
@@ -165,30 +174,47 @@ impl Agent {
         let mut sources = Vec::new();
         let mut records = Vec::new();
 
-        // Broad "what does this do" questions have no keyword a search
-        // could key off, and a small local model unreliably decides on its
-        // own to call project.information -> project.read_file in the
-        // right order. Do it deterministically instead of hoping the
-        // model gets there.
-        if self.builtin_overview_retrieval && retrieval::is_broad_overview_question(question) {
-            tracing::debug!(
-                question,
-                "broad overview question detected; running deterministic retrieval"
-            );
-            let (retrieved_sources, retrieved_records) = retrieval::run(
+        // Ground the question before the model sees it, always -- not
+        // only for broad "what does this do" questions.
+        //
+        // Restricting this to a narrow question shape is what let
+        // "Explain the session architecture." reach the model with no
+        // repository context at all, leaving it to answer from general
+        // knowledge. Retrieval is deterministic and bounded, so running
+        // it for every question costs little and removes the dependence
+        // on a small local model choosing to call the right tools.
+        // A turn cancelled before it began must do no work at all --
+        // including retrieval, which reads files and would otherwise run
+        // after the user already asked to stop.
+        if self.cancel.is_cancelled() {
+            return Ok(self.cancelled_outcome(String::new(), sources, records));
+        }
+
+        if self.builtin_overview_retrieval {
+            let retrieved = retrieval::run(
                 &self.registry,
                 &self.context,
                 self.confirmation.as_ref(),
                 history,
                 &self.events,
+                question,
+                &self.context_terms,
             )
             .await;
+            let confidence = retrieved.confidence();
             tracing::debug!(
-                sources = retrieved_sources.len(),
+                sources = retrieved.sources.len(),
+                terms = ?retrieved.terms,
+                ?confidence,
                 "deterministic retrieval complete"
             );
-            sources.extend(retrieved_sources);
-            records.extend(retrieved_records);
+            // Weak evidence is stated as such, in a trusted instruction,
+            // rather than left for the model to paper over.
+            if confidence.needs_grounding_warning() {
+                history.push(Message::system(crate::prompt::grounding_notice(confidence)));
+            }
+            sources.extend(retrieved.sources);
+            records.extend(retrieved.records);
         }
 
         for iteration in 0..self.max_iterations {
@@ -424,7 +450,10 @@ mod tests {
             registry(),
             context(tmp.path()),
             Arc::new(AlwaysDeny),
-        );
+        )
+        // These tests exercise the tool-calling loop in isolation;
+        // deterministic retrieval has its own tests.
+        .with_builtin_retrieval(false);
         let mut history = Vec::new();
         let outcome = agent.run(&mut history, "What is Orbit?").await.unwrap();
         assert_eq!(
@@ -462,7 +491,10 @@ mod tests {
             registry(),
             context(tmp.path()),
             Arc::new(AlwaysDeny),
-        );
+        )
+        // These tests exercise the tool-calling loop in isolation;
+        // deterministic retrieval has its own tests.
+        .with_builtin_retrieval(false);
         let mut history = Vec::new();
         let outcome = agent
             .run(&mut history, "What does the watchdog do?")
@@ -497,7 +529,10 @@ mod tests {
             registry(),
             context(tmp.path()),
             Arc::new(AlwaysDeny),
-        );
+        )
+        // These tests exercise the tool-calling loop in isolation;
+        // deterministic retrieval has its own tests.
+        .with_builtin_retrieval(false);
         let mut history = Vec::new();
         let outcome = agent.run(&mut history, "do something").await.unwrap();
         assert_eq!(outcome.answer, "I could not find that tool.");
@@ -522,7 +557,7 @@ mod tests {
             context(tmp.path()),
             Arc::new(AlwaysDeny),
         )
-        .with_builtin_overview_retrieval(false);
+        .with_builtin_retrieval(false);
         let mut history = Vec::new();
         let outcome = agent
             .run(&mut history, "What does this repository do?")
@@ -670,7 +705,8 @@ mod tests {
                 finish_reason: FinishReason::Stop,
             },
         ]));
-        let agent = Agent::new(provider, registry(), ctx, Arc::new(AlwaysDeny));
+        let agent = Agent::new(provider, registry(), ctx, Arc::new(AlwaysDeny))
+            .with_builtin_retrieval(false);
         let mut history = Vec::new();
         let outcome = agent.run(&mut history, "run the tests").await.unwrap();
         assert_eq!(outcome.answer, "That command is not allowed.");
@@ -762,7 +798,10 @@ mod tests {
             registry(),
             context(tmp.path()),
             Arc::new(AlwaysDeny),
-        );
+        )
+        // These tests exercise the tool-calling loop in isolation;
+        // deterministic retrieval has its own tests.
+        .with_builtin_retrieval(false);
         let mut history = Vec::new();
         let outcome = agent
             .run(&mut history, "What does the watchdog do?")
@@ -862,7 +901,8 @@ mod event_tests {
             context(tmp.path()),
             Arc::new(AlwaysDeny),
         )
-        .with_events(emitter(&sink));
+        .with_events(emitter(&sink))
+        .with_builtin_retrieval(false);
 
         let mut history = Vec::new();
         let outcome = agent
@@ -923,7 +963,8 @@ mod event_tests {
             Arc::new(AlwaysDeny),
         )
         .with_events(emitter(&sink))
-        .with_streaming(true);
+        .with_streaming(true)
+        .with_builtin_retrieval(false);
 
         let mut history = Vec::new();
         let outcome = agent.run(&mut history, "why STM32?").await.unwrap();
@@ -960,7 +1001,8 @@ mod event_tests {
             Arc::new(AlwaysDeny),
         )
         .with_events(emitter(&sink))
-        .with_streaming(true);
+        .with_streaming(true)
+        .with_builtin_retrieval(false);
 
         let mut history = Vec::new();
         let outcome = agent.run(&mut history, "hello").await.unwrap();
@@ -998,7 +1040,8 @@ mod event_tests {
             Arc::new(AlwaysDeny),
         )
         .with_events(emitter(&sink))
-        .with_cancellation(cancel);
+        .with_cancellation(cancel)
+        .with_builtin_retrieval(false);
 
         let mut history = Vec::new();
         let outcome = agent.run(&mut history, "why STM32?").await.unwrap();
@@ -1108,7 +1151,8 @@ mod event_tests {
             Arc::new(AlwaysDeny),
         )
         .with_events(events)
-        .with_cancellation(cancel);
+        .with_cancellation(cancel)
+        .with_builtin_retrieval(false);
 
         let mut history = Vec::new();
         let outcome = agent
@@ -1142,7 +1186,8 @@ mod event_tests {
             context(tmp.path()),
             Arc::new(AlwaysDeny),
         )
-        .with_events(emitter(&sink));
+        .with_events(emitter(&sink))
+        .with_builtin_retrieval(false);
 
         let mut history = Vec::new();
         agent

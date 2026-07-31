@@ -83,10 +83,29 @@ pub enum Command {
     /// MCP server/client operations.
     #[command(subcommand)]
     Mcp(McpCommand),
+    /// Drive Orbit sessions over a line-oriented protocol, for a desktop
+    /// or voice front end. See docs/APP_PROTOCOL.md.
+    #[command(subcommand)]
+    App(AppCommand),
     /// Show workspace information, or `orbit workspace init` to create one.
     Workspace(WorkspaceArgs),
     /// List every project registered in the active workspace.
     Projects,
+}
+
+#[derive(Subcommand)]
+pub enum AppCommand {
+    /// Serve sessions over stdin/stdout as JSON Lines.
+    Serve(AppServeArgs),
+}
+
+#[derive(Args)]
+pub struct AppServeArgs {
+    /// Use the JSON Lines protocol. Present so the transport is explicit
+    /// at the call site and so other transports can be added later
+    /// without changing what `orbit app serve --jsonl` means.
+    #[arg(long)]
+    pub jsonl: bool,
 }
 
 #[derive(Subcommand)]

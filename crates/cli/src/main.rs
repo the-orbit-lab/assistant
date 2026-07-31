@@ -1,3 +1,4 @@
+mod app;
 mod args;
 mod commands;
 mod confirm;
@@ -8,7 +9,7 @@ mod runtime;
 use clap::Parser;
 use orbit_core::OrbitError;
 
-use args::{Cli, Command, McpCommand};
+use args::{AppCommand, Cli, Command, McpCommand};
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -69,6 +70,7 @@ async fn dispatch(cli: Cli) -> Result<(), OrbitError> {
         Command::Doctor => commands::doctor::run(&cli.global).await,
         Command::Chat => commands::chat::run(&cli.global).await,
         Command::Mcp(McpCommand::Serve) => commands::mcp_serve::run(&cli.global).await,
+        Command::App(AppCommand::Serve(args)) => app::serve::run(&cli.global, args).await,
         Command::Workspace(args) => commands::workspace::run(&cli.global, args).await,
         Command::Projects => commands::projects::run(&cli.global).await,
     }

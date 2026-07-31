@@ -36,3 +36,32 @@ pub fn system_prompt(project_name: &str, project_description: &str) -> String {
         }
     )
 }
+
+/// A trusted instruction appended after a weakly-grounded retrieval step.
+///
+/// The failure this prevents is specific and was observed live: asked
+/// about a subject the repository really covers, the model found little,
+/// and then produced a confident generic explanation plus an unrelated
+/// code example, as though describing this project. Saying "no supporting
+/// source was found" is a correct answer; inventing a plausible one is
+/// not.
+pub fn grounding_notice(confidence: orbit_core::RetrievalConfidence) -> String {
+    let detail = match confidence {
+        orbit_core::RetrievalConfidence::None => {
+            "Deterministic retrieval found no repository content for this question."
+        }
+        _ => "Deterministic retrieval found only weak evidence for this question.",
+    };
+    format!(
+        "{detail}\n\
+         These are trusted Orbit instructions:\n\
+         - Do not answer from general knowledge as if it describes this project.\n\
+         - Say plainly that the repository search did not return enough evidence, and name \
+         what you did look at.\n\
+         - Do not invent file paths, types, functions, or behavior that no action result \
+         showed you.\n\
+         - Do not include unrelated code examples or generic tutorials unless the user \
+         explicitly asked for one.\n\
+         - You may suggest what the user could search for or which area to look in."
+    )
+}

@@ -10,6 +10,7 @@ pub mod message;
 pub mod model;
 pub mod permission;
 pub mod project;
+pub mod retrieval;
 pub mod source;
 
 pub use action::{ActionDescriptor, ActionInput, ActionOutput};
@@ -27,4 +28,5 @@ pub use permission::{
     PermissionOutcome,
 };
 pub use project::{ProjectId, ProjectPaths};
+pub use retrieval::{CONFIDENT_SOURCE_FILES, RetrievalConfidence};
 pub use source::SourceReference;

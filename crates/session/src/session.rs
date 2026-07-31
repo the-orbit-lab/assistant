@@ -25,6 +25,7 @@ use orbit_providers::ModelProvider;
 use orbit_workspace::ProjectRegistry;
 
 use crate::permission::{ConfirmationMode, SessionConfirmation};
+use crate::topic::TopicState;
 
 /// What a session is scoped to. Chosen once, at construction.
 enum Scope {
@@ -61,6 +62,10 @@ pub enum ExecutionState {
 /// Everything the session remembers, in memory only.
 pub struct SessionState {
     pub history: Vec<Message>,
+    /// What the conversation is currently about, so a follow-up question
+    /// can be resolved against it instead of retrieved on its own thin
+    /// wording. See [`crate::topic`].
+    pub topic: TopicState,
     pub records: Vec<ExecutionRecord>,
     pub sources: Vec<SourceReference>,
     pub command_runs: Vec<CommandRun>,
@@ -249,6 +254,7 @@ impl SessionRuntime {
             streaming,
             state: tokio::sync::Mutex::new(SessionState {
                 history: Vec::new(),
+                topic: TopicState::new(),
                 records: Vec::new(),
                 sources: Vec::new(),
                 command_runs: Vec::new(),
@@ -367,6 +373,7 @@ impl SessionRuntime {
         let mut state = self.state.lock().await;
         if state.active_projects != names {
             state.active_projects = names.clone();
+            state.topic.set_projects(&names);
             self.emitter.emit(EventPayload::ActiveProjectsChanged {
                 projects: names.clone(),
             });
@@ -416,6 +423,7 @@ impl SessionRuntime {
         state.sources.clear();
         state.records.clear();
         state.command_runs.clear();
+        state.topic.reset();
     }
 
     /// End the session, shutting down any external MCP servers it started.
@@ -505,6 +513,12 @@ impl SessionRuntime {
                 }
                 state.history.push(Message::user(text));
 
+                let analysis =
+                    orbit_project::analyze_with_context(text, &state.topic.context_terms());
+                state
+                    .topic
+                    .observe_question(&analysis.terms, analysis.needs_context);
+
                 let agent = Agent::new(
                     self.provider.clone(),
                     registry.clone(),
@@ -513,12 +527,14 @@ impl SessionRuntime {
                 )
                 .with_events(events.clone().with_project(Some(project.clone())))
                 .with_cancellation(cancel)
-                .with_streaming(self.streaming);
+                .with_streaming(self.streaming)
+                .with_context_terms(analysis.context_terms.clone());
 
                 let outcome = agent
                     .continue_from_history(&mut state.history, text)
                     .await?;
                 state.sources.extend(outcome.sources.iter().cloned());
+                state.topic.observe_sources(&outcome.sources);
                 (outcome, vec![project.clone()], false)
             }
 
@@ -566,18 +582,40 @@ impl SessionRuntime {
                     Some(state.active_projects.clone())
                 };
 
-                let (scope, retrieved_sources, retrieved_records) =
-                    orbit_workspace::retrieval::run(
-                        registry,
-                        context,
-                        projects,
-                        self.confirmation.as_ref(),
-                        text,
-                        explicit.as_deref(),
-                        &mut state.history,
-                        events,
-                    )
-                    .await;
+                let analysis =
+                    orbit_project::analyze_with_context(text, &state.topic.context_terms());
+                state
+                    .topic
+                    .observe_question(&analysis.terms, analysis.needs_context);
+                let context_terms = analysis.context_terms.clone();
+
+                let retrieved = orbit_workspace::retrieval::run(
+                    registry,
+                    context,
+                    projects,
+                    self.confirmation.as_ref(),
+                    text,
+                    explicit.as_deref(),
+                    &mut state.history,
+                    events,
+                    &context_terms,
+                )
+                .await;
+                let confidence = retrieved.confidence();
+                let scope = retrieved.scope.clone();
+                let retrieved_sources = retrieved.sources;
+                let retrieved_records = retrieved.records;
+
+                // Weak evidence is stated as a trusted instruction rather
+                // than left for the model to paper over with general
+                // knowledge.
+                if confidence.needs_grounding_warning() {
+                    state
+                        .history
+                        .push(Message::system(orbit_agent::prompt::grounding_notice(
+                            confidence,
+                        )));
+                }
 
                 // Retrieval genuinely ran, so its sources belong to the
                 // session even if the model call later fails. They are
@@ -586,6 +624,7 @@ impl SessionRuntime {
                 // would list every retrieved source twice (in the session
                 // and in `/sources`).
                 state.sources.extend(retrieved_sources.iter().cloned());
+                state.topic.observe_sources(&retrieved_sources);
                 state.records.extend(retrieved_records);
 
                 // A fallback to `defaults.project` deliberately does *not*
@@ -617,12 +656,13 @@ impl SessionRuntime {
                 .with_streaming(self.streaming)
                 // Workspace retrieval already ran above; the agent's own
                 // single-project retrieval would only fail here.
-                .with_builtin_overview_retrieval(false);
+                .with_builtin_retrieval(false);
 
                 let mut outcome = agent
                     .continue_from_history(&mut state.history, text)
                     .await?;
                 state.sources.extend(outcome.sources.iter().cloned());
+                state.topic.observe_sources(&outcome.sources);
                 let mut all = retrieved_sources;
                 all.append(&mut outcome.sources);
                 outcome.sources = all;

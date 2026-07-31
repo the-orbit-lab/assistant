@@ -22,9 +22,11 @@
 pub mod command;
 pub mod permission;
 pub mod session;
+pub mod topic;
 
 pub use command::{COMMAND_HELP, ParsedInput, SessionCommand, parse};
 pub use permission::{ConfirmationMode, SessionConfirmation};
 pub use session::{
     CommandRun, ExecutionState, SessionRuntime, SessionState, SessionStatus, TurnOutcome,
 };
+pub use topic::TopicState;

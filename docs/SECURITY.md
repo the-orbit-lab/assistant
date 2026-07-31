@@ -127,9 +127,60 @@ project's permissions never authorize another:
 
 ## Conversation memory
 
-`orbit chat` keeps history in process memory for the life of the process
-only. Nothing about a conversation is written to disk. Closing the
-session discards it.
+A session keeps its history, sources, and action records in process memory
+for the life of the process only. Nothing about a conversation is written
+to disk: no transcript file, no history database, no cache. Closing the
+session discards it. This is why persistent memory is a deliberate
+non-feature rather than an oversight.
+
+## The event stream
+
+Sessions are observed through a structured event stream
+([EVENTS.md](EVENTS.md)) that the CLI, the JSON Lines bridge, and any
+future GUI all consume. Two properties matter for security:
+
+- **Events never carry secrets.** Action arguments are rendered by
+  `summarize_arguments`, which redacts values whose key looks sensitive
+  (`*token*`, `*secret*`, `*password*`, `*api_key*`, `*auth*`,
+  `*credential*`, `*private*`), shortens absolute paths to their last two
+  components so a user's directory layout does not leak into logs or a UI
+  transcript, and bounds the total length. The action itself always
+  receives the original, unmodified input — the summary is for display
+  and audit only.
+- **`source_found` events cannot be forged by the model.** They are
+  emitted only from `ActionOutput::sources`, inside the Action Runtime,
+  for an action that actually executed. A model naming a path in its
+  answer produces no source event, so a citation shown by any front end
+  is always backed by real retrieval.
+
+An `action_started` event is emitted only *after* the permission check
+passes, so its presence is a reliable signal that the action really ran;
+a `deny`, a refused confirmation, or invalid input goes straight to
+`action_failed`.
+
+## Permissions in a session
+
+`ask` permissions are resolved asynchronously: the runtime emits
+`permission_required` and genuinely pauses the action until an explicit
+`allow once` or `deny once` arrives, or the turn is cancelled. Nothing
+times out into a default, because silently choosing for the user is what
+an `ask` permission exists to prevent. There is no "always allow"
+decision — a persistent change belongs in `.orbit/project.yaml`, which
+the model cannot write.
+
+A front end that cannot prompt (a non-interactive `orbit chat`, or a
+bridge client that declared `"permissions":"deny_all"`) denies explicitly
+rather than leaving a turn blocked forever. `--yes` remains the only way
+to approve without being asked, and only because the user passed it.
+
+## Cancellation
+
+Cancelling a turn stops future model generation and future tool calls, and
+releases anything waiting on a permission decision. It does **not** claim
+that completed work was undone: a file already written or a command
+already executed stays done, and the session keeps the messages, sources,
+and action records it had already collected. A cancelled answer contains
+exactly the text that was actually streamed — never more.
 
 ## Known limitations
 

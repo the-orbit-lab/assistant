@@ -251,22 +251,27 @@ the request.
 
 ### `orbit chat`
 
-The active project set is explicit session state, never inferred from a
-single ambiguous turn:
+The active project set is explicit [session](SESSIONS.md) state, never
+inferred from a single ambiguous turn:
 
 ```text
-> Work in the OBC project
-Active project(s): obc.
-> compare with docs
-Active project(s): obc, docs.
+> /use obc
+Active project(s): obc
+> Why was STM32 selected?
+• active project(s): obc
+> Now compare that with docs
+• active project(s): obc, docs
 ```
 
-A recognized switch phrase ("work in", "work on", "switch to", "use the",
-"use", followed by an exact registered name/alias) **replaces** the active
-set. Naming a project in an ordinary question that isn't a switch phrase
-**adds** to the active set rather than replacing it — so a follow-up like
-"compare with docs" broadens scope instead of losing the current project.
-The active project(s) are always echoed back, never changed silently.
+`/use <a[,b]>` **replaces** the active set, resolving each name through
+the same deterministic registry. Naming a project in an ordinary question
+**adds** it — so a follow-up like "compare that with docs" broadens scope
+instead of losing the current project. Every change is announced with an
+`active_projects_changed` event, so the active project(s) are always
+visible and never change silently.
+
+`/projects` lists what is registered, and `/status` shows the current
+selection. The full command set is in [SESSIONS.md](SESSIONS.md#session-commands).
 
 ### Default project
 
@@ -522,3 +527,7 @@ tells you about the projects that *do* work.
 - No workspace-level command execution action exists; running a
   configured command always requires selecting one project explicitly
   (`orbit --project <name> run <command>`).
+- A workspace-scoped action can touch several projects in one call, so
+  its `action_*` [events](EVENTS.md) carry no single `project` field.
+  Per-project identity for that work arrives on the `source_found`
+  events instead.

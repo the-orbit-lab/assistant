@@ -44,7 +44,10 @@ crates/
 │                .orbit/workspace.yaml, ProjectRegistry, the six
 │                workspace.* actions, deterministic multi-project
 │                retrieval -- see WORKSPACES.md
-└── cli          the `orbit` binary
+├── session      stateful multi-turn sessions: conversation state, turn
+│                orchestration, project switching, permission pausing,
+│                cancellation -- see SESSIONS.md
+└── cli          the `orbit` binary (terminal renderer + JSONL bridge)
 ```
 
 Dependency direction (no cycles):
@@ -65,7 +68,10 @@ mcp-client → actions, project (+ core)
 workspace → core, project, actions (+ agent's retrieval pattern, not
             agent itself -- see below)
 
-cli → agent, mcp-server, actions, providers, project, core, workspace
+session → core, project, actions, providers, agent, workspace
+
+cli → agent, mcp-server, actions, providers, project, core, workspace,
+      session
 ```
 
 `orbit-actions`' public API has no MCP types in it. `orbit-agent` depends
@@ -188,13 +194,60 @@ project-specific. See [WORKSPACES.md](WORKSPACES.md) for the full design:
 discovery precedence, name/alias resolution, natural-language routing,
 context budgeting, multi-project sources, and permission isolation.
 
+## Sessions and the Agent Event Stream
+
+`orbit-session` adds stateful, multi-turn conversations on top of the
+agent, and `orbit-core::event` adds the structured stream through which
+every front end observes them:
+
+```mermaid
+flowchart TD
+    Input[User input] --> Session[Session Runtime\norbit-session]
+    Session --> Agent[Agent + Workspace + Actions + Provider]
+    Agent --> Bus[Agent Event Bus\norbit_core::EventSink]
+    Bus --> CLI[CLI renderer\norbit chat]
+    Bus --> JSONL[JSONL bridge\norbit app serve --jsonl]
+    Bus --> GUI[future SwiftUI client]
+```
+
+The rule this enforces is that **agent logic never lives in a renderer or
+a wire protocol**. `orbit chat` and the JSONL bridge are both pure
+consumers of the same events; neither contains retrieval, permission
+policy, or a tool-calling loop, and adding a third front end requires no
+change to any of them.
+
+Two consequences worth noting:
+
+- **Events are emitted from the Action Runtime, not around it.**
+  `ActionRegistry::execute_observed` is the same code path as
+  `execute` (which simply passes a null emitter), because only that path
+  knows when validation passed and when a permission check resolved.
+  Observing a session therefore cannot diverge from running one, and no
+  execution logic is duplicated to produce events.
+- **`ConfirmationProvider` is async.** Obtaining an `ask` decision
+  genuinely is asynchronous — a session must be able to pause an action,
+  emit `permission_required`, and resume only when a real decision
+  arrives, without blocking the runtime thread the rest of the session
+  runs on.
+
+Streaming is part of the provider abstraction rather than of Ollama:
+`ModelProvider::chat_streaming` has a default implementation that
+delegates to `chat` and reports the whole answer as a single delta, so a
+non-streaming provider stays fully usable and front ends need only one
+rendering path. See [SESSIONS.md](SESSIONS.md), [EVENTS.md](EVENTS.md),
+and [APP_PROTOCOL.md](APP_PROTOCOL.md).
+
 ## What is not built yet
 
 - Anthropic/OpenAI providers (the trait supports adding them without
   touching the agent).
-- A desktop application or voice interface (the CLI is a thin layer over
-  `orbit-agent`; neither interface requires moving agent logic).
-- Persistent conversation memory (`orbit chat` keeps history in process
-  memory only, by design — see [SECURITY.md](SECURITY.md)).
+- A desktop application or voice interface. The foundation they need —
+  stateful sessions, the event stream, streaming responses, structured
+  permissions, cancellation, and the JSONL bridge — is built; the
+  SwiftUI app, microphone capture, speech recognition, text-to-speech,
+  and wake-word detection are not.
+- Persistent conversation memory (sessions keep history in process
+  memory only, by design — see [SESSIONS.md](SESSIONS.md) and
+  [SECURITY.md](SECURITY.md)).
 - A vector database or embedding-based search (local search in
   `orbit-project::search` is deterministic and file-based).

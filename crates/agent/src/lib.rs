@@ -14,3 +14,8 @@ pub mod session;
 pub use agent::{Agent, AgentOutcome, DEFAULT_MAX_ITERATIONS, DEFAULT_REQUEST_TIMEOUT};
 pub use retrieval::is_broad_overview_question;
 pub use session::build_registry;
+
+/// Re-exported so callers that receive a manager from [`build_registry`]
+/// can hold and shut it down without depending on `orbit-mcp-client`
+/// directly -- to them it is an opaque session handle, not an MCP API.
+pub use orbit_mcp_client::{McpClientManager, McpConnectionWarning};

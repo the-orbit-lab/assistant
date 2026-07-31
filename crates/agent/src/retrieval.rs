@@ -1,6 +1,7 @@
 use orbit_actions::{ActionContext, ActionRegistry};
 use orbit_core::{
-    ActionInput, ConfirmationProvider, ExecutionRecord, Message, SourceReference, ToolCall,
+    ActionInput, ConfirmationProvider, EventEmitter, EventPayload, ExecutionRecord, Message,
+    SourceReference, ToolCall,
 };
 use serde_json::{Value, json};
 
@@ -71,10 +72,16 @@ pub async fn run(
     context: &ActionContext,
     confirmation: &dyn ConfirmationProvider,
     history: &mut Vec<Message>,
+    events: &EventEmitter,
 ) -> (Vec<SourceReference>, Vec<ExecutionRecord>) {
     let mut sources = Vec::new();
     let mut records = Vec::new();
     let mut next_call_id = 0u32;
+
+    let project = context.config.project.name.clone();
+    events.emit(EventPayload::RetrievalStarted {
+        scope: vec![project.clone()],
+    });
 
     execute_synthetic(
         registry,
@@ -86,10 +93,11 @@ pub async fn run(
         &mut sources,
         &mut records,
         &mut next_call_id,
+        events,
     )
     .await;
 
-    for path in overview_candidates(registry, context, confirmation).await {
+    for path in overview_candidates(registry, context, confirmation, events).await {
         execute_synthetic(
             registry,
             context,
@@ -100,9 +108,16 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
     }
+
+    events.emit(EventPayload::RetrievalCompleted {
+        scope: vec![project],
+        action_count: records.len(),
+        source_count: sources.len(),
+    });
 
     (sources, records)
 }
@@ -115,13 +130,16 @@ async fn overview_candidates(
     registry: &ActionRegistry,
     context: &ActionContext,
     confirmation: &dyn ConfirmationProvider,
+    events: &EventEmitter,
 ) -> Vec<String> {
     let (_, result) = registry
-        .execute(
+        .execute_observed(
             context,
             "project.list_files",
             ActionInput::empty(),
             confirmation,
+            events,
+            &events.next_execution_id(),
         )
         .await;
     let Ok(output) = result else {
@@ -170,9 +188,17 @@ async fn execute_synthetic(
     sources: &mut Vec<SourceReference>,
     records: &mut Vec<ExecutionRecord>,
     next_call_id: &mut u32,
+    events: &EventEmitter,
 ) {
     let (record, result) = registry
-        .execute(context, name, ActionInput(arguments.clone()), confirmation)
+        .execute_observed(
+            context,
+            name,
+            ActionInput(arguments.clone()),
+            confirmation,
+            events,
+            &events.next_execution_id(),
+        )
         .await;
     records.push(record);
 

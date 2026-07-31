@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use orbit_actions::{ActionContext, ActionRegistry};
 use orbit_core::{
-    ActionInput, ConfirmationProvider, ExecutionRecord, FinishReason, Message, ModelRequest,
-    OrbitError, SourceReference, ToolDefinition,
+    ActionInput, CancellationToken, ConfirmationProvider, EventEmitter, EventPayload,
+    ExecutionRecord, FinishReason, Message, ModelRequest, ModelResponse, OrbitError,
+    SourceReference, ToolDefinition,
 };
 use orbit_providers::ModelProvider;
 
@@ -22,6 +23,11 @@ pub struct AgentOutcome {
     pub answer: String,
     pub sources: Vec<SourceReference>,
     pub records: Vec<ExecutionRecord>,
+    /// The turn stopped early because it was cancelled. `answer` then
+    /// holds whatever text had already been produced (possibly empty),
+    /// and `sources`/`records` hold the work that really completed before
+    /// the stop — cancellation never claims that finished work was undone.
+    pub cancelled: bool,
 }
 
 /// Orbit's own agent loop: calls the Action Runtime directly. It never
@@ -35,6 +41,9 @@ pub struct Agent {
     max_iterations: u32,
     request_timeout: Duration,
     builtin_overview_retrieval: bool,
+    events: EventEmitter,
+    cancel: CancellationToken,
+    streaming: bool,
 }
 
 impl Agent {
@@ -52,6 +61,9 @@ impl Agent {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             builtin_overview_retrieval: true,
+            events: EventEmitter::null(),
+            cancel: CancellationToken::new(),
+            streaming: false,
         }
     }
 
@@ -62,6 +74,31 @@ impl Agent {
 
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Report this run's progress to `events`. Without this the agent
+    /// behaves identically but silently — the emitter defaults to a null
+    /// one, so nothing branches on whether anyone is observing.
+    pub fn with_events(mut self, events: EventEmitter) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Allow this run to be cancelled. The token is checked before each
+    /// model request, between tool calls, and (via the delta handler)
+    /// between streamed chunks.
+    pub fn with_cancellation(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Request incremental delivery of assistant text as
+    /// `ResponseDelta` events. Falls back transparently to a single
+    /// delta when the provider cannot stream, so enabling it is always
+    /// safe.
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
         self
     }
 
@@ -143,6 +180,7 @@ impl Agent {
                 &self.context,
                 self.confirmation.as_ref(),
                 history,
+                &self.events,
             )
             .await;
             tracing::debug!(
@@ -154,6 +192,10 @@ impl Agent {
         }
 
         for iteration in 0..self.max_iterations {
+            if self.cancel.is_cancelled() {
+                return Ok(self.cancelled_outcome(String::new(), sources, records));
+            }
+
             tracing::debug!(iteration, "requesting model completion");
             let request = ModelRequest {
                 model: self.context.config.model.model.clone(),
@@ -162,7 +204,21 @@ impl Agent {
                 timeout: self.request_timeout,
             };
 
-            let response = self.provider.chat(&request).await?;
+            let response = match self.complete(&request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    self.events.emit(EventPayload::Failure {
+                        message: err.to_string(),
+                    });
+                    return Err(err);
+                }
+            };
+
+            // The provider stops early when the delta handler reports a
+            // cancellation, so a partially streamed answer lands here.
+            if self.cancel.is_cancelled() {
+                return Ok(self.cancelled_outcome(response.message.content, sources, records));
+            }
 
             if response.finish_reason == FinishReason::ToolCalls
                 && !response.message.tool_calls.is_empty()
@@ -175,13 +231,21 @@ impl Agent {
                 history.push(response.message);
 
                 for call in calls {
+                    if self.cancel.is_cancelled() {
+                        // Stop before running anything further. Whatever
+                        // already ran stays in `records`/`sources`.
+                        return Ok(self.cancelled_outcome(String::new(), sources, records));
+                    }
+
                     let (record, result) = self
                         .registry
-                        .execute(
+                        .execute_observed(
                             &self.context,
                             &call.name,
                             ActionInput(call.arguments),
                             self.confirmation.as_ref(),
+                            &self.events,
+                            &self.events.next_execution_id(),
                         )
                         .await;
                     tracing::debug!(
@@ -218,12 +282,70 @@ impl Agent {
                 answer: response.message.content,
                 sources,
                 records,
+                cancelled: false,
             });
         }
 
-        Err(OrbitError::AgentIterationLimitReached {
+        let err = OrbitError::AgentIterationLimitReached {
             limit: self.max_iterations,
-        })
+        };
+        self.events.emit(EventPayload::Failure {
+            message: err.to_string(),
+        });
+        Err(err)
+    }
+
+    /// One model request, reported as
+    /// `ModelResponseStarted` → `ResponseDelta`* → `ModelResponseCompleted`.
+    ///
+    /// Every iteration of the loop produces one of these, including
+    /// iterations whose response only requests tools; the *last* one in a
+    /// turn is the one carrying the final answer.
+    async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, OrbitError> {
+        let streaming = self.streaming && self.provider.supports_streaming();
+        self.events.emit(EventPayload::ModelResponseStarted {
+            model: request.model.clone(),
+            streaming,
+        });
+
+        let response = if self.streaming {
+            let events = self.events.clone();
+            let cancel = self.cancel.clone();
+            // Returning false stops the provider reading the stream, which
+            // is how a cancelled turn interrupts generation mid-answer.
+            let handler = move |delta: &str| {
+                events.emit(EventPayload::ResponseDelta {
+                    text: delta.to_string(),
+                });
+                !cancel.is_cancelled()
+            };
+            self.provider.chat_streaming(request, &handler).await?
+        } else {
+            self.provider.chat(request).await?
+        };
+
+        self.events.emit(EventPayload::ModelResponseCompleted {
+            text: response.message.content.clone(),
+        });
+        Ok(response)
+    }
+
+    fn cancelled_outcome(
+        &self,
+        answer: String,
+        sources: Vec<SourceReference>,
+        records: Vec<ExecutionRecord>,
+    ) -> AgentOutcome {
+        tracing::debug!("agent run cancelled");
+        self.events.emit(EventPayload::ExecutionCancelled {
+            reason: "cancelled by user".to_string(),
+        });
+        AgentOutcome {
+            answer,
+            sources: dedupe_sources(sources),
+            records,
+            cancelled: true,
+        }
     }
 }
 
@@ -661,6 +783,384 @@ mod tests {
                 .sources
                 .iter()
                 .any(|s| s.path.ends_with("watchdog.md"))
+        );
+    }
+}
+
+/// Event-stream and cancellation behavior of the agent loop itself.
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use orbit_core::{AlwaysDeny, CollectingSink, EventEmitter, SessionId, ToolCall, TurnId};
+    use orbit_project::ProjectConfig;
+    use orbit_providers::MockProvider;
+    use serde_json::json;
+
+    fn context(root: &std::path::Path) -> Arc<ActionContext> {
+        let root = root.canonicalize().unwrap();
+        let config = ProjectConfig::parse(
+            "version: 1\nproject:\n  name: obc\ncontext:\n  include:\n    - \"**/*\"\n",
+        )
+        .unwrap();
+        Arc::new(ActionContext {
+            config_path: root.join(".orbit/project.yaml"),
+            root,
+            config,
+        })
+    }
+
+    fn registry() -> Arc<ActionRegistry> {
+        Arc::new(orbit_actions::native_registry().unwrap())
+    }
+
+    fn answer(text: &str) -> orbit_core::ModelResponse {
+        orbit_core::ModelResponse {
+            message: Message::assistant(text),
+            finish_reason: FinishReason::Stop,
+        }
+    }
+
+    fn search_call() -> orbit_core::ModelResponse {
+        orbit_core::ModelResponse {
+            message: Message::assistant_tool_calls(vec![ToolCall {
+                id: "call_0".to_string(),
+                name: "project.search".to_string(),
+                arguments: json!({"query": "watchdog"}),
+            }]),
+            finish_reason: FinishReason::ToolCalls,
+        }
+    }
+
+    fn fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("watchdog.md"),
+            "# Watchdog\nresets the system on brownout\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn emitter(sink: &Arc<CollectingSink>) -> EventEmitter {
+        EventEmitter::new(sink.clone(), SessionId("sess-a".to_string())).with_turn(TurnId::new(1))
+    }
+
+    /// The documented per-turn ordering: a tool call is fully reported
+    /// (requested → started → source → completed) before the model
+    /// response that consumes it completes.
+    #[tokio::test]
+    async fn a_tool_calling_turn_emits_events_in_the_documented_order() {
+        let tmp = fixture();
+        let sink = Arc::new(CollectingSink::new());
+        let provider = Arc::new(MockProvider::new(vec![
+            search_call(),
+            answer("The watchdog resets the system."),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_events(emitter(&sink));
+
+        let mut history = Vec::new();
+        let outcome = agent
+            .run(&mut history, "what does the watchdog do?")
+            .await
+            .unwrap();
+        assert!(!outcome.cancelled);
+
+        // Consecutive repeats are collapsed so the assertion pins the
+        // *ordering*, not how many results the search engine happened to
+        // rank (one query can legitimately match a filename and a line).
+        let mut shape: Vec<&str> = Vec::new();
+        for name in sink.type_names() {
+            if shape.last() != Some(&name) {
+                shape.push(name);
+            }
+        }
+        assert_eq!(
+            shape,
+            vec![
+                "model_response_started",
+                "model_response_completed",
+                "action_requested",
+                "action_started",
+                "source_found",
+                "action_completed",
+                "model_response_started",
+                "model_response_completed",
+            ]
+        );
+
+        // Every action event must carry the project it ran against.
+        let events = sink.events();
+        let action_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.type_name().starts_with("action_") || e.type_name() == "source_found")
+            .collect();
+        assert!(
+            action_events
+                .iter()
+                .all(|e| e.project.as_deref() == Some("obc"))
+        );
+        // ...and the turn id, so a UI can group them.
+        assert!(events.iter().all(|e| e.turn_id == Some(TurnId::new(1))));
+    }
+
+    #[tokio::test]
+    async fn streaming_deltas_are_emitted_and_reconstruct_the_answer() {
+        let tmp = fixture();
+        let sink = Arc::new(CollectingSink::new());
+        let provider = Arc::new(MockProvider::streaming(vec![answer(
+            "STM32 was chosen for low power draw.",
+        )]));
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_events(emitter(&sink))
+        .with_streaming(true);
+
+        let mut history = Vec::new();
+        let outcome = agent.run(&mut history, "why STM32?").await.unwrap();
+
+        let deltas: String = sink
+            .events()
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ResponseDelta { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, outcome.answer);
+        assert_eq!(deltas, "STM32 was chosen for low power draw.");
+
+        // Streaming must be reported as such when the provider supports it.
+        match &sink.events()[0].payload {
+            EventPayload::ModelResponseStarted { streaming, .. } => assert!(*streaming),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A non-streaming provider must still satisfy the delta contract, so
+    /// a UI can render identically regardless of provider capability.
+    #[tokio::test]
+    async fn a_non_streaming_provider_still_produces_one_delta() {
+        let tmp = fixture();
+        let sink = Arc::new(CollectingSink::new());
+        let provider = Arc::new(MockProvider::new(vec![answer("Buffered answer.")]));
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_events(emitter(&sink))
+        .with_streaming(true);
+
+        let mut history = Vec::new();
+        let outcome = agent.run(&mut history, "hello").await.unwrap();
+
+        let deltas: Vec<String> = sink
+            .events()
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ResponseDelta { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["Buffered answer.".to_string()]);
+        assert_eq!(deltas.concat(), outcome.answer);
+        match &sink.events()[0].payload {
+            EventPayload::ModelResponseStarted { streaming, .. } => {
+                assert!(!streaming, "must not claim to stream when it cannot")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_before_the_first_model_request_stops_immediately() {
+        let tmp = fixture();
+        let sink = Arc::new(CollectingSink::new());
+        let provider = Arc::new(MockProvider::new(vec![answer("never reached")]));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let agent = Agent::new(
+            provider.clone(),
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_events(emitter(&sink))
+        .with_cancellation(cancel);
+
+        let mut history = Vec::new();
+        let outcome = agent.run(&mut history, "why STM32?").await.unwrap();
+
+        assert!(outcome.cancelled);
+        assert!(outcome.answer.is_empty());
+        assert!(
+            provider.recorded_requests().is_empty(),
+            "a cancelled turn must not reach the provider at all"
+        );
+        assert_eq!(sink.type_names(), vec!["execution_cancelled"]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_stream_keeps_the_text_already_delivered() {
+        let tmp = fixture();
+        let sink = Arc::new(CollectingSink::new());
+        let provider = Arc::new(
+            MockProvider::streaming(vec![answer("aaaabbbbccccdddd")]).with_delta_chunk_chars(4),
+        );
+        let cancel = CancellationToken::new();
+
+        // Cancel as soon as the first delta is observed.
+        struct CancelOnFirst {
+            cancel: CancellationToken,
+            inner: Arc<CollectingSink>,
+        }
+        impl orbit_core::EventSink for CancelOnFirst {
+            fn emit(&self, event: orbit_core::AgentEvent) {
+                if matches!(event.payload, EventPayload::ResponseDelta { .. }) {
+                    self.cancel.cancel();
+                }
+                self.inner.emit(event);
+            }
+        }
+
+        let events = EventEmitter::new(
+            Arc::new(CancelOnFirst {
+                cancel: cancel.clone(),
+                inner: sink.clone(),
+            }),
+            SessionId("sess-a".to_string()),
+        );
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_events(events)
+        .with_streaming(true)
+        .with_cancellation(cancel);
+
+        let mut history = Vec::new();
+        let outcome = agent.run(&mut history, "why STM32?").await.unwrap();
+
+        assert!(outcome.cancelled);
+        let deltas: String = sink
+            .events()
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::ResponseDelta { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, "aaaa", "generation must stop at the first delta");
+        assert_eq!(
+            outcome.answer, deltas,
+            "a cancelled answer must equal exactly what was streamed"
+        );
+        assert!(sink.type_names().contains(&"execution_cancelled"));
+    }
+
+    /// Cancelling between the model's tool request and its execution must
+    /// prevent the action from running at all.
+    #[tokio::test]
+    async fn cancelling_before_an_action_prevents_it_from_running() {
+        let tmp = fixture();
+        let sink = Arc::new(CollectingSink::new());
+        let provider = Arc::new(MockProvider::new(vec![search_call(), answer("unused")]));
+        let cancel = CancellationToken::new();
+
+        struct CancelAfterToolRequest {
+            cancel: CancellationToken,
+            inner: Arc<CollectingSink>,
+        }
+        impl orbit_core::EventSink for CancelAfterToolRequest {
+            fn emit(&self, event: orbit_core::AgentEvent) {
+                if matches!(event.payload, EventPayload::ModelResponseCompleted { .. }) {
+                    self.cancel.cancel();
+                }
+                self.inner.emit(event);
+            }
+        }
+
+        let events = EventEmitter::new(
+            Arc::new(CancelAfterToolRequest {
+                cancel: cancel.clone(),
+                inner: sink.clone(),
+            }),
+            SessionId("sess-a".to_string()),
+        );
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_events(events)
+        .with_cancellation(cancel);
+
+        let mut history = Vec::new();
+        let outcome = agent
+            .run(&mut history, "what does the watchdog do?")
+            .await
+            .unwrap();
+
+        assert!(outcome.cancelled);
+        let names = sink.type_names();
+        assert!(
+            !names.contains(&"action_started"),
+            "the action must never have started: {names:?}"
+        );
+        assert!(outcome.records.is_empty());
+        assert!(names.contains(&"execution_cancelled"));
+    }
+
+    /// Source events must come only from real action output -- a model
+    /// naming a path in prose can never produce one.
+    #[tokio::test]
+    async fn model_prose_cannot_produce_a_source_event() {
+        let tmp = fixture();
+        let sink = Arc::new(CollectingSink::new());
+        let provider = Arc::new(MockProvider::new(vec![
+            search_call(),
+            answer("Also see secret-notes.md and /etc/passwd for details."),
+        ]));
+        let agent = Agent::new(
+            provider,
+            registry(),
+            context(tmp.path()),
+            Arc::new(AlwaysDeny),
+        )
+        .with_events(emitter(&sink));
+
+        let mut history = Vec::new();
+        agent
+            .run(&mut history, "what does the watchdog do?")
+            .await
+            .unwrap();
+
+        let source_paths: Vec<String> = sink
+            .events()
+            .iter()
+            .filter_map(|e| match &e.payload {
+                EventPayload::SourceFound { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            source_paths.iter().all(|p| p.contains("watchdog.md")),
+            "only real action output may become a source: {source_paths:?}"
         );
     }
 }

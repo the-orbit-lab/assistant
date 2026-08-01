@@ -1084,6 +1084,7 @@ dependencies = [
  "orbit-mcp-client",
  "orbit-project",
  "orbit-providers",
+ "orbit-retrieval",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1175,6 +1176,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "orbit-retrieval"
+version = "0.1.0"
+dependencies = [
+ "orbit-core",
+ "orbit-project",
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

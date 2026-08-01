@@ -27,6 +27,10 @@ context:
     - docs/**
     - src/**
     - tests/**
+    # A Cargo workspace keeps its code in crates/<name>/src/**, not in a
+    # top-level src/. Without this, a workspace project's implementation
+    # is invisible to search and to grounded answers.
+    - crates/**
 
   # Exclude always wins over include, and a mandatory set — .git/**,
   # .orbit/**, target/**, node_modules/**, .env, .env.*, secrets/**,

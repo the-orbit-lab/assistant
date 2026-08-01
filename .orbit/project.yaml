@@ -8,7 +8,7 @@ project:
 model:
   # Orbit's first-class provider is a local Ollama instance.
   provider: ollama
-  model: qwen3:latest
+  model: qwen2.5:latest
   endpoint: http://localhost:11434
 
 context:
@@ -20,6 +20,10 @@ context:
     - docs/**
     - src/**
     - tests/**
+    # A Cargo workspace keeps its code in crates/<name>/src/**, not in a
+    # top-level src/. Without this, a workspace project's implementation
+    # is invisible to search and to grounded answers.
+    - crates/**
 
   # Exclude always wins over include. A mandatory set (.git, .orbit, secrets,
   # *.key, *.pem, .env*, target, node_modules) is enforced in addition to

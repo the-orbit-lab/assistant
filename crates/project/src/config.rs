@@ -121,6 +121,16 @@ fn default_include() -> Vec<String> {
         "docs/**".to_string(),
         "src/**".to_string(),
         "tests/**".to_string(),
+        // A Cargo workspace keeps its code in `crates/<name>/src/**`, not
+        // in a top-level `src/`. Without these, a workspace project's
+        // entire implementation is invisible to search and to grounded
+        // answers -- the repository looks like documentation only, and a
+        // question about a type defined in code can never be answered
+        // from the code that defines it.
+        "crates/**".to_string(),
+        // The same shape under other common monorepo roots.
+        "packages/**".to_string(),
+        "libs/**".to_string(),
     ]
 }
 
@@ -293,6 +303,10 @@ context:
     - docs/**
     - src/**
     - tests/**
+    # A Cargo workspace keeps its code in crates/<name>/src/**, not in a
+    # top-level src/. Without this, a workspace project's implementation
+    # is invisible to search and to grounded answers.
+    - crates/**
 
   # Exclude always wins over include. A mandatory set (.git, .orbit, secrets,
   # *.key, *.pem, .env*, target, node_modules) is enforced in addition to

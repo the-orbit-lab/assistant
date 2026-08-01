@@ -194,9 +194,10 @@ details in [docs/SECURITY.md](docs/SECURITY.md).
 - Duplicate YAML mapping keys in `.orbit/project.yaml` are not detected as
   a config error (standard YAML last-value-wins behavior).
 - `orbit chat` history is in-process only; nothing is persisted to disk.
-- Search is deterministic lexical ranking (BM25 over normalized tokens,
-  with filename/path/heading/symbol signals) — no embeddings, no vector
-  database, and no semantic matching. See
+- Retrieval is deterministic: BM25 over normalized tokens, a `syn`-built
+  Rust symbol index, path/heading signals, rank fusion, and
+  evidence-quality reranking — no embeddings, no vector database, and no
+  semantic matching. The symbol index is Rust-only. See
   [docs/SEARCH.md](docs/SEARCH.md#known-limitations).
 - Workspace project routing (both natural-language scanning and
   name/alias resolution) is deterministic text matching, not semantic —

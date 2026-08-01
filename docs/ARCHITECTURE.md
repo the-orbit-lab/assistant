@@ -41,6 +41,11 @@ crates/
 │                actions into one registry for a session
 ├── mcp-client   Orbit as an MCP client (consumes external stdio servers)
 ├── mcp-server   Orbit as an MCP server (exposes filtered native actions)
+├── retrieval    two-stage evidence retrieval: query planning, a `syn`
+│                symbol index, AST-backed symbol evidence bundles, five
+│                candidate generators, reciprocal rank fusion,
+│                evidence-quality reranking, and diversified selection
+│                -- see SEARCH.md
 ├── workspace    orchestration over several sibling Project Runtimes:
 │                .orbit/workspace.yaml, ProjectRegistry, the six
 │                workspace.* actions, deterministic multi-project
@@ -59,8 +64,10 @@ core
 ├── actions   (project)
 └── providers
 
+retrieval → core, project
+
 agent
-├── core, actions, providers
+├── core, actions, providers, retrieval
 └── mcp-client
 
 mcp-server → actions (+ core)
@@ -114,9 +121,10 @@ validation, then permission enforcement (`allow`/`ask`/`deny`), then
 execution, then an `ExecutionRecord`. The model can request an action; it
 can never grant itself permission to run one.
 
-See [SEARCH.md](SEARCH.md) for the retrieval pipeline: tokenization,
-query analysis, BM25 ranking, conversational topic state, progressive
-file reads, and the grounding policy.
+See [SEARCH.md](SEARCH.md) for the retrieval pipeline: query planning,
+the symbol index, the five candidate generators, rank fusion,
+evidence-quality reranking, diversified selection, progressive file
+reads, and the grounding policy.
 
 ### Deterministic retrieval
 

@@ -26,19 +26,201 @@ Three separate defects produced that:
 
 All three are addressed below.
 
-## Pipeline
+## Two stages, not one ranking
+
+Lexical ranking answers *"which lines mention these words"*. An
+explanation question asks something else: *"which file defines this
+thing"*. Those are different questions, and a single scoring function
+cannot serve both — a long document that repeats the query terms will
+out-score the twenty-line struct that declares them, every time.
+
+That is not hypothetical. Asked to "Explain SessionRuntime and how it
+stores session state", Orbit once answered out of `docs/SEARCH.md` and
+described the retrieval pipeline. The lexical engine had produced good
+candidates; nothing downstream could tell a file that *defines* a
+concept from a verbose file that merely mentions it.
+
+So retrieval is split into layers that each do one job
+(`orbit-retrieval`):
 
 ```text
 question
-   ↓  query analysis          (orbit-project::query)
-terms + phrase + context
-   ↓  lexical search          (orbit-project::search)
-ranked lines and files
-   ↓  progressive reads       (retrieval)
-full text of the strongest matches
-   ↓  confidence              (orbit-core::RetrievalConfidence)
+   ↓  query planner            (plan)      intent, entities, concepts
+   ↓  candidate generators     (candidate) five independent proposals
+   ↓  reciprocal rank fusion   (fusion)    agreement, not intensity
+   ↓  reranker                 (rerank)    evidence quality, not term hits
+   ↓  evidence selector        (select)    a diverse, bounded set
+   ↓  progressive reads        (retrieval) the selected files, in full
+   ↓  confidence               (orbit-core::RetrievalConfidence)
 grounded answer, or an explicit "not enough evidence"
 ```
+
+### Query planner
+
+Classifies the question into an intent — symbol explanation,
+architecture, implementation location, requirement comparison, decision,
+failure investigation, or general — and extracts the entities it names.
+The intent decides which *kinds* of evidence are worth preferring.
+
+Entities come from three sources: backtick-quoted spans, identifier-shaped
+words (`SessionRuntime`, `run_turn`), and multi-word runs that normalize
+onto a symbol the index actually contains, so "session runtime" reaches
+`SessionRuntime` without guessing. A word is only accepted from the index
+when it survives stopword filtering *and* names a type — otherwise a
+repository containing `fn explain` would make "explain" the subject of
+every question that used the verb.
+
+### Candidate generators
+
+Five independent proposals, each answering a different question:
+
+| Generator | Answers |
+|---|---|
+| lexical | which lines mention these words (BM25, as before) |
+| symbol | where is this identifier declared (`syn` AST index) |
+| path | which files are *named* after the subject |
+| heading | which documentation section is titled after it |
+| context | what was this conversation already looking at |
+
+The symbol generator is the direct answer to the reported failure: a
+declaration mentions its own name exactly once, so term frequency can
+never rank it first.
+
+### Fusion
+
+Reciprocal Rank Fusion combines the five rankings using only *position*,
+never their incomparable scores:
+
+```text
+score(d) = Σ  weight(g) / (60 + rank_g(d))
+```
+
+A file ranked 3rd by three generators beats one ranked 1st by a single
+generator. Agreement is a far better proxy for "this is about the
+subject" than any one generator's enthusiasm.
+
+### Reranker
+
+Judges what a candidate *is*, not how often it matched:
+
+| Feature | Separates |
+|---|---|
+| declares a named entity | the definition from every mention of it |
+| subject alignment (filename, title) | `SESSIONS.md` from `SEARCH.md` |
+| mention ratio over file length | a topic document from a passing reference |
+| heading match | a section about X from a document containing X |
+| generator agreement | corroborated evidence from a lone hit |
+| intent alignment | what this question actually needs |
+
+Each candidate is typed — Definition, Implementation,
+DomainDocumentation, Architecture, Requirement, ADR, Test,
+IncidentalReference — using structural conventions (a `tests/`
+directory, a numbered file under `architecture/`), never a list of this
+repository's filenames.
+
+**Incidental-mention detection.** A candidate is incidental when nothing
+about its file says it is about the subject: it declares none of the
+named entities, it is not named or titled for them, no heading announces
+them, and the mentions are sparse relative to its length. Incidental
+evidence is demoted, not deleted — a hard exclusion would make a
+genuinely relevant passage unreachable — and the selector caps how many
+may appear.
+
+An optional bounded local-model reranking pass exists
+(`rerank::validate_model_rerank`). It is strictly validated: the model
+sees numbered candidates and may return only a permutation of those
+numbers. Anything else — an out-of-range index, a repeat, prose, a path —
+is rejected and the deterministic order stands. **The model can never
+introduce a candidate, name a file, or cause a read.**
+
+### Symbol evidence
+
+Knowing *where* a type is declared is not enough to explain it. A single
+line reading `pub struct SessionRuntime {` says nothing about the state
+it stores, so a model falls back on whatever else is in its context —
+which is how an answer about a type ends up describing the tests that
+exercise it.
+
+For a question naming an entity, `orbit-retrieval::evidence` builds an
+AST-backed bundle from `syn`:
+
+```rust
+pub struct SymbolEvidence {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub definition: SourceSpan,        // declaration incl. doc comments
+    pub fields: Vec<FieldEvidence>,    // name, type as written, docs, span
+    pub impl_blocks: Vec<ImplEvidence>,// inherent and trait, with methods
+    pub documentation: Vec<SourceSpan>,
+}
+```
+
+Every span is exact, so a comment mentioning `struct SessionRuntime` can
+never be mistaken for the declaration.
+
+Whole `impl` blocks are the wrong granularity — `impl SessionRuntime` is
+570 lines — so the bundle is quoted under a **span budget**: the
+declaration whole (it is short and carries the fields), then individual
+methods, most relevant first, each truncated to its opening lines if
+oversized. A method too large to quote keeps its doc comment and
+signature rather than being dropped. The cost of explaining a type does
+not scale with the size of the type.
+
+Which methods are relevant is decided by the question, not by a list of
+interesting names. Ranking is term overlap against each method's name,
+signature, and docs — the signature matters, because a method taking
+`&mut SessionState` answers "how does it store state" even though
+nothing in its name says so.
+
+Spans are fetched with **ranged `project.read_file`**, through the same
+permission checks a whole-file read performs. A range can only ever
+return less than the caller was already allowed to see.
+
+### Evidence selector
+
+Ranking and selecting are different jobs. Taking the top N by score
+gives N variations of the same claim — three passages of one document,
+or five tests of one type. Selection instead maximizes *marginal* value
+(in the spirit of Maximal Marginal Relevance): at each step it takes the
+best candidate **after** subtracting how much it repeats what is already
+chosen, with hard caps of 2 per file, 3 per evidence type, and 1
+incidental reference in a set of 6.
+
+Two rules protect the code that defines the subject:
+
+- **A slot is reserved for direct implementation.** While the set has no
+  Definition or Implementation, the last slot is held for one, so
+  better-scoring prose cannot squeeze the declaration out entirely.
+- **Tests are capped at one while an implementation exists.** A test
+  repeats the type's name on every line and describes what the author
+  expected, which reads like documentation to a ranking and not at all
+  like it to a reader. Where the repository has no implementation to
+  offer, the cap lifts — "how is this tested" is a real question.
+
+A score floor of zero applies. A question the repository cannot answer
+selects *nothing*, so the grounding policy can say so, rather than
+returning the six least-bad incidental mentions and looking sourced.
+
+### Reading
+
+Selection is ordered for coverage; reading is a different decision.
+Only a few files fit in a local model's context, so the read list leads
+with the evidence types the intent asked for, ordered by score. Without
+this, "Explain SessionRuntime" spends one of its three read slots on a
+536-line test file and the answer describes the tests.
+
+When a symbol bundle exists it is read **last**, after the supporting
+documents, and that ordering is load-bearing: a model answers from what
+is nearest its question, and an 8 KB architecture document read after
+the declaration produced an answer about session lifecycle in general
+rather than about the type. A trusted instruction naming the declaration
+accompanies it, stating a fact the AST established rather than asking
+the model to verify anything.
+
+Only the files actually selected and read are cited. An earlier version
+also cited every line the lexical ranking matched; those excerpt
+citations were the visible half of the reported failure, listing five
+test files under an answer about one type.
 
 ## Tokenization (`orbit-project::lexical`)
 

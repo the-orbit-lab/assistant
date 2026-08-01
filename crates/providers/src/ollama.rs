@@ -40,10 +40,10 @@ impl OllamaProvider {
         let response = self
             .client
             .get(&url)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(AVAILABILITY_TIMEOUT_SECS))
             .send()
             .await
-            .map_err(|e| connection_error(&self.endpoint, &e))?;
+            .map_err(|e| connection_error(&self.endpoint, &e, AVAILABILITY_TIMEOUT_SECS))?;
 
         if !response.status().is_success() {
             return Err(ProviderError::Other {
@@ -80,14 +80,26 @@ impl OllamaProvider {
 }
 
 /// `qwen2.5` should match an installed `qwen2.5:latest`, and vice versa.
+/// How long the availability probe (`GET /api/tags`) may take. Short on
+/// purpose: it answers "is the server there", not "can it think".
+const AVAILABILITY_TIMEOUT_SECS: u64 = 5;
+
 fn tag_matches(installed: &str, requested: &str) -> bool {
     let strip = |s: &str| s.split(':').next().unwrap_or(s).to_string();
     strip(installed) == strip(requested)
 }
 
-fn connection_error(endpoint: &str, err: &reqwest::Error) -> ProviderError {
+/// Map a transport failure onto a [`ProviderError`].
+///
+/// `timeout_secs` must be the deadline that actually applied to this
+/// request: the availability check uses its own short one, while a chat
+/// uses `ModelRequest::timeout`. Reporting a fixed number here told users
+/// a chat had given up after 5 seconds when it had in fact waited 30,
+/// which is the difference between "the server is down" and "the model
+/// is too slow for this much context".
+fn connection_error(endpoint: &str, err: &reqwest::Error, timeout_secs: u64) -> ProviderError {
     if err.is_timeout() {
-        ProviderError::Timeout { timeout_secs: 5 }
+        ProviderError::Timeout { timeout_secs }
     } else {
         ProviderError::ConnectionFailed {
             endpoint: endpoint.to_string(),
@@ -121,7 +133,7 @@ impl OllamaProvider {
             .json(&wire)
             .send()
             .await
-            .map_err(|e| connection_error(&self.endpoint, &e))?;
+            .map_err(|e| connection_error(&self.endpoint, &e, request.timeout.as_secs()))?;
 
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {

@@ -24,4 +24,4 @@ pub use lexical::{content_terms, is_reference_word, is_stopword, stem, tokenize}
 pub use query::{AnalyzedQuery, analyze, analyze_with_context};
 pub use read::{read_allowed_file, read_allowed_file_truncated};
 pub use root::{discover_project_root, project_paths_at};
-pub use search::{SearchOptions, SearchResult, search_files};
+pub use search::{LexicalIndex, SearchOptions, SearchResult, search_files};

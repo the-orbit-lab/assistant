@@ -20,6 +20,7 @@
 //! requirement.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use orbit_core::SourceReference;
 
@@ -160,17 +161,84 @@ fn markdown_heading(line: &str) -> Option<String> {
     }
 }
 
-struct IndexedFile<'a> {
-    file: &'a DiscoveredFile,
+struct IndexedFile {
+    relative_path: PathBuf,
+    is_markdown: bool,
+    is_rust: bool,
     content: String,
     /// Distinct normalized terms anywhere in the file, for IDF.
     terms: HashSet<String>,
     filename_terms: HashSet<String>,
     path_terms: HashSet<String>,
+    /// Total tokens in the file, accumulated while tokenizing for
+    /// `terms` so BM25's average line length costs no extra pass.
+    token_count: usize,
+    line_count: usize,
+}
+
+/// A tokenized corpus, reusable across queries.
+///
+/// Building this is the expensive part of a search: every file is read
+/// and tokenized, twice over (once for its term set, once to measure
+/// average line length for BM25). A caller that runs several queries
+/// against one corpus — the retrieval pipeline runs five generators per
+/// question — should build it once and search it repeatedly, rather than
+/// paying that cost per query.
+pub struct LexicalIndex {
+    files: Vec<IndexedFile>,
+    /// Mean tokens per line across the corpus, for BM25 length
+    /// normalization.
+    average_line_terms: f64,
+}
+
+impl LexicalIndex {
+    /// Read and tokenize every searchable file once.
+    pub fn build(files: &[DiscoveredFile]) -> Self {
+        let indexed = index(files);
+        let average_line_terms = {
+            let (total, count) = indexed.iter().fold((0usize, 0usize), |(t, c), f| {
+                (t + f.token_count, c + f.line_count)
+            });
+            if count == 0 {
+                1.0
+            } else {
+                (total as f64 / count as f64).max(1.0)
+            }
+        };
+        Self {
+            files: indexed,
+            average_line_terms,
+        }
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Search this corpus for `query`, tokenizing it as [`search_files`]
+    /// would.
+    pub fn search(&self, query: &str, options: &SearchOptions) -> Vec<SearchResult> {
+        let query_terms = lexical::content_terms(query);
+        if query_terms.is_empty() {
+            return Vec::new();
+        }
+        let phrase = normalized_phrase(query);
+        self.search_terms(&query_terms, phrase.as_deref(), options)
+    }
+
+    /// Search this corpus for already-normalized `terms`.
+    pub fn search_terms(
+        &self,
+        terms: &[String],
+        phrase: Option<&str>,
+        options: &SearchOptions,
+    ) -> Vec<SearchResult> {
+        search_indexed(self, terms, phrase, options)
+    }
 }
 
 /// Read and tokenize every searchable file once.
-fn index<'a>(files: &'a [DiscoveredFile]) -> Vec<IndexedFile<'a>> {
+fn index(files: &[DiscoveredFile]) -> Vec<IndexedFile> {
     let mut indexed = Vec::new();
     for file in files {
         let path_text = file.relative_path.to_string_lossy().to_string();
@@ -200,25 +268,28 @@ fn index<'a>(files: &'a [DiscoveredFile]) -> Vec<IndexedFile<'a>> {
             String::new()
         };
 
-        let mut terms: HashSet<String> = lexical::tokenize(&content)
-            .into_iter()
-            .map(|t| t.stem)
-            .collect();
+        let content_tokens = lexical::tokenize(&content);
+        let token_count = content_tokens.len();
+        let mut terms: HashSet<String> = content_tokens.into_iter().map(|t| t.stem).collect();
         terms.extend(path_terms.iter().cloned());
 
         indexed.push(IndexedFile {
-            file,
+            is_markdown: is_markdown(file),
+            is_rust: is_rust(file),
+            relative_path: file.relative_path.clone(),
+            line_count: content.lines().count(),
             content,
             terms,
             filename_terms,
             path_terms,
+            token_count,
         });
     }
     indexed
 }
 
 /// Inverse document frequency per query term, over the indexed files.
-fn idf_table(indexed: &[IndexedFile<'_>], query_terms: &[String]) -> HashMap<String, f64> {
+fn idf_table(indexed: &[IndexedFile], query_terms: &[String]) -> HashMap<String, f64> {
     let total = indexed.len().max(1) as f64;
     query_terms
         .iter()
@@ -277,26 +348,28 @@ pub fn search_terms(
     if terms.is_empty() {
         return Vec::new();
     }
-    let indexed = index(files);
-    let idf = idf_table(&indexed, terms);
-    let query_set: HashSet<&String> = terms.iter().collect();
+    search_indexed(&LexicalIndex::build(files), terms, phrase, options)
+}
 
-    let average_line_terms = {
-        let (total, count) = indexed.iter().fold((0usize, 0usize), |(t, c), f| {
-            let lines = f.content.lines().count();
-            (t + lexical::tokenize(&f.content).len(), c + lines)
-        });
-        if count == 0 {
-            1.0
-        } else {
-            (total as f64 / count as f64).max(1.0)
-        }
-    };
+/// The ranking itself, over an already-built index.
+fn search_indexed(
+    index: &LexicalIndex,
+    terms: &[String],
+    phrase: Option<&str>,
+    options: &SearchOptions,
+) -> Vec<SearchResult> {
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let indexed = &index.files;
+    let average_line_terms = index.average_line_terms;
+    let idf = idf_table(indexed, terms);
+    let query_set: HashSet<&String> = terms.iter().collect();
 
     let mut results: Vec<SearchResult> = Vec::new();
 
-    for entry in &indexed {
-        let display_path = entry.file.relative_path.clone();
+    for entry in indexed {
+        let display_path = entry.relative_path.clone();
 
         let filename_hits: Vec<&String> = terms
             .iter()
@@ -351,8 +424,8 @@ pub fn search_terms(
 
         let mut per_file: Vec<SearchResult> = Vec::new();
         let mut current_heading: Option<String> = None;
-        let markdown = is_markdown(entry.file);
-        let rust = is_rust(entry.file);
+        let markdown = entry.is_markdown;
+        let rust = entry.is_rust;
 
         for (index, line) in entry.content.lines().enumerate() {
             let line_number = index + 1;

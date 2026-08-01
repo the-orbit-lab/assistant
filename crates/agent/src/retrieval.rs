@@ -5,6 +5,9 @@ use orbit_core::{
     ActionInput, ConfirmationProvider, EventEmitter, EventPayload, ExecutionRecord, Message,
     RetrievalConfidence, SourceReference, ToolCall,
 };
+use orbit_retrieval::evidence::{SourceSpan, SpanBudget};
+use orbit_retrieval::pipeline::{Pipeline, PipelineInput};
+use orbit_retrieval::select::SelectionLimits;
 use serde_json::{Value, json};
 
 /// Question shapes broad enough that there's no obvious keyword to search
@@ -44,9 +47,18 @@ const MAX_OVERVIEW_READS: usize = 2;
 /// and it is done here rather than asked of the user, because the
 /// ranking already knows which files are most likely relevant.
 const MAX_FOLLOW_UP_READS: usize = 3;
+/// Whole-file reads allowed *after* a symbol bundle has been quoted.
+///
+/// The bundle already carries the direct answer in a few dozen lines. A
+/// second and third whole document after it does not add evidence, it
+/// adds twelve kilobytes each — and because they arrive last, they are
+/// the freshest thing in the model's context when it starts to answer.
+/// That is how a question about a type gets answered from an
+/// architecture overview.
+const MAX_READS_WITH_SYMBOL_EVIDENCE: usize = 1;
 const FOLLOW_UP_READ_BYTES: u64 = 12_000;
-/// Results considered when choosing which files to read in full.
-const SEARCH_LIMIT: usize = 12;
+/// Ranked and rejected rows included in the `--verbose` retrieval report.
+const DIAGNOSTIC_ROWS: usize = 8;
 
 /// What one deterministic retrieval step produced.
 #[derive(Debug, Clone, Default)]
@@ -55,6 +67,11 @@ pub struct RetrievalOutcome {
     pub records: Vec<ExecutionRecord>,
     /// Terms actually searched for, for `--verbose` diagnostics.
     pub terms: Vec<String>,
+    /// How the evidence pipeline reached its selection, for `--verbose`.
+    ///
+    /// Structural only -- paths, evidence types, and scores. No file is
+    /// opened to produce it and it can never expose an excluded file.
+    pub diagnostics: Option<String>,
 }
 
 impl RetrievalOutcome {
@@ -139,31 +156,57 @@ pub async fn run(
     let analysis = orbit_project::analyze_with_context(question, context_terms);
     let terms = analysis.all_terms();
     let mut read_paths: Vec<String> = Vec::new();
+    let mut diagnostics: Option<String> = None;
 
-    // Step 1-2: lexical search over the project. Ranking already favors
-    // filenames, path components, and headings, so a question about
-    // architecture reaches `docs/ARCHITECTURE.md` without a special case
-    // for documentation.
+    // Step 1-2: decide what evidence this question needs.
+    //
+    // The two-stage pipeline (plan → generate → fuse → rerank → select)
+    // decides *which files* are worth reading; a plain lexical ranking
+    // cannot, because it measures how often a file repeats the question's
+    // words rather than whether the file is about the subject. See
+    // `orbit_retrieval`.
+    //
+    // The pipeline only ever ranks files that project discovery already
+    // produced, and it reads nothing itself: every file that reaches the
+    // model below goes through `project.read_file` and the same
+    // permission enforcement a model-initiated call would face.
+    // This replaces an earlier synthetic `project.search` step, which
+    // cited every line the ranking matched. Those excerpt citations were
+    // the visible half of the reported failure: an answer about
+    // `SessionRuntime` listed five test files and an unrelated module,
+    // because a lexical hit is not evidence — it is a place a word
+    // occurs. Citing only what was actually selected and read makes the
+    // source list mean "this is what the answer rests on". The model
+    // still has `project.search` as a tool when it wants breadth.
+    let mut symbol_spans: Vec<SourceSpan> = Vec::new();
+    let mut symbol_anchor: Option<String> = None;
     if !terms.is_empty() {
-        let output = execute_synthetic(
-            registry,
-            context,
-            confirmation,
-            history,
-            "project.search",
-            json!({ "query": analysis.to_search_string(), "limit": SEARCH_LIMIT }),
-            &mut sources,
-            &mut records,
-            &mut next_call_id,
-            events,
-        )
-        .await;
-        read_paths = strongest_paths(output.as_ref(), MAX_FOLLOW_UP_READS);
+        let planned = plan_evidence(context, question, context_terms);
+        read_paths = planned.read_paths;
+        diagnostics = planned.diagnostics;
+        symbol_spans = planned.symbol_spans;
+        symbol_anchor = planned.symbol_anchor;
     }
 
-    // Step 3-4: read the strongest matches in full. A one-line excerpt
-    // rarely answers "explain X"; the surrounding prose does.
-    for path in &read_paths {
+    // Step 4: read the strongest matches in full. A one-line excerpt
+    // rarely answers "explain X"; the surrounding prose does. The file
+    // whose declaration was already quoted is skipped: its precise spans
+    // are better evidence than its first twelve kilobytes, and reading
+    // both would spend the budget twice on one file.
+    let quoted: Vec<String> = symbol_spans
+        .iter()
+        .map(|s| s.path.to_string_lossy().to_string())
+        .collect();
+    let whole_file_budget = if symbol_spans.is_empty() {
+        MAX_FOLLOW_UP_READS
+    } else {
+        MAX_READS_WITH_SYMBOL_EVIDENCE
+    };
+    for path in read_paths
+        .iter()
+        .filter(|p| !quoted.contains(p))
+        .take(whole_file_budget)
+    {
         execute_synthetic(
             registry,
             context,
@@ -177,6 +220,51 @@ pub async fn run(
             events,
         )
         .await;
+    }
+
+    // Step 5: quote the declaration and its most relevant methods, each
+    // as a ranged read through the same permission-checked action a
+    // whole-file read uses. Reading only these lines is what keeps a
+    // 570-line `impl` block from costing the rest of the evidence its
+    // place in the model's context.
+    //
+    // These come *last*, after the supporting documents, and the
+    // ordering is load-bearing. A model answers from what is nearest
+    // its question: with an 8 KB architecture document read after the
+    // declaration, an answer about `SessionRuntime` came back
+    // describing session lifecycle in general. The direct evidence has
+    // to be the last thing it reads, and it is also the only evidence
+    // that is definitionally about the subject rather than merely
+    // ranked as relevant to it.
+    for span in &symbol_spans {
+        execute_synthetic(
+            registry,
+            context,
+            confirmation,
+            history,
+            "project.read_file",
+            json!({
+                "path": span.path.to_string_lossy(),
+                "line_start": span.line_start,
+                "line_end": span.line_end,
+                "max_bytes": FOLLOW_UP_READ_BYTES,
+                "truncate": true,
+            }),
+            &mut sources,
+            &mut records,
+            &mut next_call_id,
+            events,
+        )
+        .await;
+    }
+
+    // A trusted instruction naming the declaration, so the model treats
+    // it as the definition rather than as one more retrieved document.
+    // This states a fact retrieval established -- the AST says this file
+    // and these lines declare the entity -- and never asks the model to
+    // find or verify anything itself.
+    if let Some(anchor) = &symbol_anchor {
+        history.push(Message::system(anchor.clone()));
     }
 
     // Fallback: nothing matched (or there was nothing to search for), so
@@ -210,22 +298,156 @@ pub async fn run(
         sources,
         records,
         terms,
+        diagnostics,
     }
 }
 
-/// Distinct file paths from a `project.search` result, strongest first.
-fn strongest_paths(output: Option<&Value>, limit: usize) -> Vec<String> {
-    let Some(results) = output.and_then(|o| o["results"].as_array()) else {
-        return Vec::new();
+/// Choose which files to read in full, and explain the choice.
+///
+/// Runs the two-stage retrieval pipeline over the project's discovered
+/// files. Returns project-relative paths in selection order, plus a
+/// diagnostics report for `--verbose`.
+///
+/// Discovery failure is not an error here: retrieval is a best-effort
+/// head start, and the overview fallback still applies. Note also that
+/// the pipeline is built per turn — the index costs roughly 200 ms on a
+/// repository of this size — because `ActionContext` is rebuilt per turn
+/// and a project's files can change between questions. A session-lifetime
+/// cache belongs with the session, not here.
+fn plan_evidence(
+    context: &ActionContext,
+    question: &str,
+    context_terms: &[String],
+) -> EvidencePlan {
+    let Ok(files) = orbit_project::discover_files(&context.root, &context.config) else {
+        return EvidencePlan::default();
     };
-    let mut seen = HashSet::new();
-    let mut paths = Vec::new();
-    for result in results {
-        let Some(path) = result["path"].as_str() else {
-            continue;
-        };
-        if seen.insert(path.to_string()) {
-            paths.push(path.to_string());
+
+    let pipeline = Pipeline::new(files);
+    let output = pipeline.run(
+        &PipelineInput {
+            question: question.to_string(),
+            context_terms: context_terms.to_vec(),
+            // The session's topic terms already carry the conversation
+            // forward; only paths produced by real retrieval would be
+            // eligible here, never a path the model mentioned in prose.
+            recent_paths: Vec::new(),
+            target_projects: vec![context.config.project.name.clone()],
+        },
+        &SelectionLimits::default(),
+    );
+
+    let paths = read_order(
+        &output.selection.items,
+        &output.plan.preferred_evidence_types,
+        MAX_FOLLOW_UP_READS,
+    );
+
+    // The exact regions of the declaration and its most relevant
+    // methods. These are quoted *before* anything the ranking produced:
+    // a declaration is not a guess about relevance, it is the thing the
+    // question named, and a model that sees it first has the fields in
+    // front of it when it starts to answer.
+    let symbol_spans = output
+        .symbol_evidence
+        .as_ref()
+        .map(|evidence| {
+            evidence.budgeted_spans(
+                &output.plan.terms_about(&evidence.name),
+                &SpanBudget::default(),
+            )
+        })
+        .unwrap_or_default();
+
+    let source = output
+        .symbol_evidence
+        .as_ref()
+        .and_then(|evidence| pipeline.corpus().get(&evidence.definition.path))
+        .map(|file| file.content.clone());
+
+    let report = output.diagnostics.report_with_evidence(
+        &output.plan,
+        &output.selection,
+        output.symbol_evidence.as_ref(),
+        source.as_deref(),
+        DIAGNOSTIC_ROWS,
+    );
+
+    let symbol_anchor = output.symbol_evidence.as_ref().map(|evidence| {
+        format!(
+            "The repository declares `{}` as a {} at {}:{}-{}, with {} field(s) \
+             and {} method(s). That declaration is the definition of `{}`; \
+             explain it and its fields directly. Do not describe the tests \
+             that exercise it, and do not substitute a general overview of \
+             the surrounding subsystem for the type itself.",
+            evidence.name,
+            evidence.kind.as_str(),
+            evidence.definition.path.display(),
+            evidence.definition.line_start,
+            evidence.definition.line_end,
+            evidence.fields.len(),
+            evidence.method_count(),
+            evidence.name,
+        )
+    });
+
+    EvidencePlan {
+        symbol_spans,
+        symbol_anchor,
+        read_paths: paths,
+        diagnostics: Some(report),
+    }
+}
+
+/// What the pipeline decided this turn should put in front of the model.
+#[derive(Debug, Default)]
+struct EvidencePlan {
+    /// Exact regions of the named symbol's declaration and methods.
+    symbol_spans: Vec<SourceSpan>,
+    /// A trusted instruction naming where the entity is declared.
+    symbol_anchor: Option<String>,
+    /// Whole files to read after them.
+    read_paths: Vec<String>,
+    diagnostics: Option<String>,
+}
+
+/// Order the selected evidence for *reading*, as opposed to for coverage.
+///
+/// The selection is deliberately diversified: it alternates between kinds
+/// of evidence so the set as a whole can support an explanation. Reading
+/// is a different decision. Only a handful of files fit in a local
+/// model's context, and a long one crowds out everything read after it,
+/// so the read list leads with the evidence types this intent actually
+/// asked for, ordered by score, and falls back to the rest only to fill
+/// the quota.
+///
+/// Without this, "Explain SessionRuntime" reads a 536-line test file
+/// alongside the declaration, and the answer describes the tests.
+fn read_order(
+    items: &[orbit_retrieval::rerank::RankedEvidence],
+    preferred: &[orbit_retrieval::plan::EvidenceType],
+    limit: usize,
+) -> Vec<String> {
+    let mut wanted: Vec<&orbit_retrieval::rerank::RankedEvidence> = items
+        .iter()
+        .filter(|i| preferred.contains(&i.evidence_type))
+        .collect();
+    wanted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.candidate.path.cmp(&b.candidate.path))
+    });
+
+    let rest = items
+        .iter()
+        .filter(|i| !preferred.contains(&i.evidence_type));
+
+    let mut paths: Vec<String> = Vec::new();
+    for item in wanted.into_iter().chain(rest) {
+        let path = item.candidate.path.to_string_lossy().to_string();
+        if !paths.contains(&path) {
+            paths.push(path);
         }
         if paths.len() >= limit {
             break;
@@ -377,5 +599,103 @@ mod tests {
     fn ignores_files_nested_more_than_one_level_deep() {
         assert_eq!(score_overview_candidate("a/b/README.md"), None);
         assert!(score_overview_candidate("docs/PROJECT_SPEC.md").is_some());
+    }
+
+    /// The reported failure, at the read-selection layer.
+    ///
+    /// A long test file that legitimately made the evidence set must not
+    /// consume one of the three read slots ahead of the declaration and
+    /// the subject's own documentation — reading it is what made the
+    /// answer describe the tests instead of the type.
+    #[test]
+    fn reads_lead_with_the_evidence_types_the_intent_asked_for() {
+        use orbit_retrieval::candidate::{Candidate, CandidateOrigin};
+        use orbit_retrieval::plan::EvidenceType;
+        use orbit_retrieval::rerank::{EvidenceFeatures, RankedEvidence};
+
+        let item = |path: &str, kind: EvidenceType, score: f64| RankedEvidence {
+            candidate: Candidate {
+                path: std::path::PathBuf::from(path),
+                line_start: 1,
+                line_end: 1,
+                excerpt: String::new(),
+                section: None,
+                origin: CandidateOrigin::Lexical,
+                generator_score: score,
+                symbol_kind: None,
+                defines_entity: None,
+            },
+            evidence_type: kind,
+            features: EvidenceFeatures::default(),
+            fused_score: score,
+            score,
+            origin_summary: String::new(),
+        };
+
+        // Selection order deliberately interleaves kinds; the test file
+        // sits above one of the documentation entries.
+        let items = vec![
+            item(
+                "crates/session/src/session.rs",
+                EvidenceType::Definition,
+                1.48,
+            ),
+            item("docs/SESSIONS.md", EvidenceType::DomainDocumentation, 1.30),
+            item(
+                "crates/session/tests/session_runtime.rs",
+                EvidenceType::Test,
+                0.56,
+            ),
+            item("docs/ARCHITECTURE.md", EvidenceType::Architecture, 0.44),
+        ];
+        let preferred = vec![
+            EvidenceType::Definition,
+            EvidenceType::Implementation,
+            EvidenceType::DomainDocumentation,
+            EvidenceType::Architecture,
+        ];
+
+        assert_eq!(
+            read_order(&items, &preferred, 3),
+            vec![
+                "crates/session/src/session.rs".to_string(),
+                "docs/SESSIONS.md".to_string(),
+                "docs/ARCHITECTURE.md".to_string(),
+            ]
+        );
+    }
+
+    /// A type the intent did not ask for is still reachable — it fills
+    /// the quota rather than being excluded, because "how is this
+    /// tested?" is a real question and the caps are about ordering.
+    #[test]
+    fn unpreferred_evidence_still_fills_the_read_quota() {
+        use orbit_retrieval::candidate::{Candidate, CandidateOrigin};
+        use orbit_retrieval::plan::EvidenceType;
+        use orbit_retrieval::rerank::{EvidenceFeatures, RankedEvidence};
+
+        let only_a_test = vec![RankedEvidence {
+            candidate: Candidate {
+                path: std::path::PathBuf::from("crates/a/tests/t.rs"),
+                line_start: 1,
+                line_end: 1,
+                excerpt: String::new(),
+                section: None,
+                origin: CandidateOrigin::Lexical,
+                generator_score: 1.0,
+                symbol_kind: None,
+                defines_entity: None,
+            },
+            evidence_type: EvidenceType::Test,
+            features: EvidenceFeatures::default(),
+            fused_score: 1.0,
+            score: 1.0,
+            origin_summary: String::new(),
+        }];
+
+        assert_eq!(
+            read_order(&only_a_test, &[EvidenceType::Definition], 3),
+            vec!["crates/a/tests/t.rs".to_string()]
+        );
     }
 }

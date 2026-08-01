@@ -208,6 +208,12 @@ impl Agent {
                 ?confidence,
                 "deterministic retrieval complete"
             );
+            // The full pipeline explanation is verbose enough to deserve
+            // its own record, so `--verbose` can show how the evidence
+            // was chosen without every debug line carrying it.
+            if let Some(report) = &retrieved.diagnostics {
+                tracing::debug!("evidence selection:\n{report}");
+            }
             // Weak evidence is stated as such, in a trusted instruction,
             // rather than left for the model to paper over.
             if confidence.needs_grounding_warning() {

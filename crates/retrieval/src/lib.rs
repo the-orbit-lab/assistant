@@ -22,6 +22,7 @@
 //! reranker, a coverage change in the selector, and neither should require
 //! touching the other.
 
+pub mod agenda;
 pub mod candidate;
 pub mod evidence;
 pub mod fusion;

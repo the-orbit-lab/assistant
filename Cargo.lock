@@ -1218,6 +1218,7 @@ dependencies = [
  "orbit-actions",
  "orbit-core",
  "orbit-project",
+ "orbit-retrieval",
  "serde",
  "serde_json",
  "serde_norway",

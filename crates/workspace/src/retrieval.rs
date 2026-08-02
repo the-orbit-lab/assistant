@@ -20,6 +20,9 @@ use orbit_core::{
     ConfirmationProvider, EventEmitter, EventPayload, ExecutionRecord, Message,
     RetrievalConfidence, SourceReference, ToolCall,
 };
+use orbit_retrieval::agenda::EvidenceAgenda;
+use orbit_retrieval::pipeline::{Pipeline, PipelineInput};
+use orbit_retrieval::select::SelectionLimits;
 use serde_json::{Value, json};
 
 use crate::budget::MAX_PROJECTS_PER_REQUEST;
@@ -161,13 +164,37 @@ fn score_overview_candidate(path: &str) -> Option<u32> {
 }
 
 const MAX_OVERVIEW_READS_PER_PROJECT: usize = 2;
-/// How many of the strongest search hits are read in full, across all
-/// selected projects. A one-line excerpt rarely answers "explain X"; the
-/// surrounding prose does, and the ranking already knows which files are
-/// most likely relevant, so the user is never asked to choose.
-const MAX_FOLLOW_UP_READS: usize = 3;
-const SEARCH_LIMIT_PER_PROJECT: usize = 5;
 const OVERVIEW_READ_BYTES: u64 = 8_000;
+
+/// Build the evidence agenda for one project in the scope.
+///
+/// Each registered project keeps its own root, its own configuration,
+/// and its own security boundary, so the corpus is discovered per
+/// project rather than merged. A project whose configuration failed to
+/// load contributes nothing instead of failing the turn.
+fn plan_project_evidence(
+    project_registry: &ProjectRegistry,
+    project: &str,
+    question: &str,
+    context_terms: &[String],
+    scope: &[String],
+) -> Option<EvidenceAgenda> {
+    let entry = project_registry.get_project(project)?;
+    let context = entry.action_context().ok()?;
+    let files = orbit_project::discover_files(&context.root, &context.config).ok()?;
+
+    let pipeline = Pipeline::new(files);
+    Some(orbit_retrieval::agenda::build(
+        &pipeline,
+        &PipelineInput {
+            question: question.to_string(),
+            context_terms: context_terms.to_vec(),
+            recent_paths: Vec::new(),
+            target_projects: scope.to_vec(),
+        },
+        &SelectionLimits::default(),
+    ))
+}
 
 /// What one workspace-scoped retrieval step produced.
 #[derive(Debug, Clone, Default)]
@@ -206,6 +233,15 @@ pub async fn run(
     context_terms: &[String],
 ) -> RetrievalOutcome {
     let scope = resolve_scope(question, explicit_projects, project_registry);
+    // Which retrieval implementation this run used. Named explicitly
+    // because the reported failure was not a ranking bug -- it was this
+    // path silently running a *different* retrieval from the one every
+    // test exercised, with nothing in the output saying so.
+    tracing::debug!(
+        retrieval_implementation = "orbit-retrieval pipeline (workspace)",
+        scope = ?scope.projects,
+        "deterministic retrieval starting"
+    );
     let mut sources = Vec::new();
     let mut records = Vec::new();
     let mut next_call_id = 0u32;
@@ -281,50 +317,93 @@ pub async fn run(
     // file inside their own project and would drown out the real subject.
     let analysis = analyze_question(question, &bounded_scope, project_registry, context_terms);
     let terms = analysis.all_terms();
-    let mut follow_up: Vec<(String, String)> = Vec::new();
+    let mut any_evidence = false;
 
+    // The same evidence planner the single-project path uses. This
+    // module previously ran `workspace.search` and read whatever it
+    // ranked highest, which is why `orbit chat` in workspace mode kept
+    // answering a question about `SessionRuntime` out of
+    // `tests/grounding.rs` while every unit test of the new pipeline
+    // passed: the pipeline was never on this path at all.
+    //
+    // The planner decides; this function only translates its decisions
+    // into `workspace.*` action calls, so the two front ends cannot
+    // drift apart again.
     if !terms.is_empty() {
-        let output = call(
-            registry,
-            action_ctx,
-            confirmation,
-            history,
-            "workspace.search",
-            json!({
-                "projects": bounded_scope,
-                "query": analysis.to_search_string(),
-                "limit_per_project": SEARCH_LIMIT_PER_PROJECT,
-            }),
-            &mut sources,
-            &mut records,
-            &mut next_call_id,
-            events,
-        )
-        .await;
-        follow_up = strongest_files(output.as_ref(), MAX_FOLLOW_UP_READS);
-    }
+        for project in &bounded_scope {
+            let Some(agenda) = plan_project_evidence(
+                project_registry,
+                project,
+                question,
+                context_terms,
+                &bounded_scope,
+            ) else {
+                continue;
+            };
+            if agenda.is_empty() {
+                continue;
+            }
+            any_evidence = true;
+            orbit_retrieval::agenda::trace(&agenda, "orbit-retrieval pipeline", Some(project));
+            if let Some(report) = &agenda.diagnostics {
+                tracing::debug!(project = %project, "evidence selection:\n{report}");
+            }
 
-    // Read the strongest matches in full, so the model gets prose rather
-    // than a list of matching lines.
-    for (project, path) in &follow_up {
-        call(
-            registry,
-            action_ctx,
-            confirmation,
-            history,
-            "workspace.read_file",
-            json!({ "project": project, "path": path, "max_bytes": OVERVIEW_READ_BYTES, "truncate": true }),
-            &mut sources,
-            &mut records,
-            &mut next_call_id,
-            events,
-        )
-        .await;
+            // Whole files first, then the exact declaration spans: a
+            // model answers from what is nearest its question.
+            for read in &agenda.reads {
+                call(
+                    registry,
+                    action_ctx,
+                    confirmation,
+                    history,
+                    "workspace.read_file",
+                    json!({
+                        "project": project,
+                        "path": read.path.to_string_lossy(),
+                        "max_bytes": OVERVIEW_READ_BYTES,
+                        "truncate": true,
+                    }),
+                    &mut sources,
+                    &mut records,
+                    &mut next_call_id,
+                    events,
+                )
+                .await;
+            }
+
+            for span in &agenda.symbol_spans {
+                call(
+                    registry,
+                    action_ctx,
+                    confirmation,
+                    history,
+                    "workspace.read_file",
+                    json!({
+                        "project": project,
+                        "path": span.path.to_string_lossy(),
+                        "line_start": span.line_start,
+                        "line_end": span.line_end,
+                        "max_bytes": OVERVIEW_READ_BYTES,
+                        "truncate": true,
+                    }),
+                    &mut sources,
+                    &mut records,
+                    &mut next_call_id,
+                    events,
+                )
+                .await;
+            }
+
+            if let Some(anchor) = agenda.anchor {
+                history.push(Message::system(anchor));
+            }
+        }
     }
 
     // Nothing matched: fall back to whatever reads like an overview,
     // which is what answers "what does this project do".
-    if follow_up.is_empty() {
+    if !any_evidence {
         for project in &bounded_scope {
             for path in
                 overview_candidates(registry, action_ctx, confirmation, project, events).await
@@ -382,30 +461,6 @@ fn analyze_question(
     analysis.terms.retain(|t| !excluded.contains(t));
     analysis.context_terms.retain(|t| !excluded.contains(t));
     analysis
-}
-
-/// Distinct `(project, path)` pairs from a `workspace.search` result,
-/// strongest first.
-fn strongest_files(output: Option<&Value>, limit: usize) -> Vec<(String, String)> {
-    let Some(results) = output.and_then(|o| o["results"].as_array()) else {
-        return Vec::new();
-    };
-    let mut seen = HashSet::new();
-    let mut files = Vec::new();
-    for result in results {
-        let (Some(project), Some(path)) = (result["project"].as_str(), result["path"].as_str())
-        else {
-            continue;
-        };
-        let key = (project.to_string(), path.to_string());
-        if seen.insert(key.clone()) {
-            files.push(key);
-        }
-        if files.len() >= limit {
-            break;
-        }
-    }
-    files
 }
 
 async fn overview_candidates(

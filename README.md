@@ -153,6 +153,23 @@ never reimplements agent logic. See
 [docs/APP_PROTOCOL.md](docs/APP_PROTOCOL.md) for the commands, the frames,
 and notes for a SwiftUI client.
 
+## Desktop app
+
+A Tauri 2 + React client lives in [apps/desktop](apps/desktop). It drives
+the same JSON Lines protocol as `orbit app serve --jsonl` — text chat,
+a live activity timeline, real sources, permission prompts, and
+cancellation.
+
+```bash
+cargo build --release           # the backend the app drives
+cd apps/desktop && pnpm install
+pnpm tauri dev                  # then choose a workspace and Connect
+```
+
+Voice input and spoken responses are **not** built yet, and there is no
+wake word — see [docs/VOICE.md](docs/VOICE.md) for the intended design
+and [docs/DESKTOP_APP.md](docs/DESKTOP_APP.md) for the architecture.
+
 ## MCP
 
 ```bash
@@ -204,9 +221,9 @@ details in [docs/SECURITY.md](docs/SECURITY.md).
   see [docs/WORKSPACES.md](docs/WORKSPACES.md#known-limitations).
 - Sessions are in-memory only; there is no persistent conversation
   memory, and a session runs one turn at a time.
-- The desktop and voice interfaces are not built. Their foundation —
-  sessions, events, streaming, structured permissions, cancellation, and
-  the JSONL bridge — is.
+- The desktop app covers text chat, activity, sources, permissions, and
+  cancellation; voice input and spoken responses are not built, and
+  answers render as plain text rather than Markdown.
 
 ## Development
 

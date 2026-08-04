@@ -1,4 +1,9 @@
 [workspace]
+# The desktop app is a Tauri package with its own dependency graph and
+# release cadence; keeping it out of this workspace means `cargo test
+# --workspace` still means "the Orbit backend" and the app cannot
+# perturb the backend's lockfile.
+exclude = ["apps/desktop/src-tauri"]
 resolver = "2"
 members = [
     "crates/core",

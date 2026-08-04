@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Orbit desktop needs a directory picker and the app's own commands. It is deliberately given no filesystem, shell, or HTTP capability: the only way it reaches a project is through Orbit's own actions and protocol.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "dialog:allow-open"
+  ]
+}

@@ -182,6 +182,101 @@ impl SymbolIndex {
         &self.symbols
     }
 
+    /// Symbols whose name or documentation matches the given concept
+    /// terms, best first.
+    ///
+    /// [`lookup`](Self::lookup) answers "where is this identifier
+    /// declared" and needs the identifier. A behavior question does not
+    /// have one: "How is cancellation checked during model streaming?"
+    /// names `cancel`, `stream`, and `check` — concepts, not symbols. So
+    /// this matches the *words inside* identifiers, which is how
+    /// `cancel_current_turn`, `CancellationToken`, and `chat_streaming`
+    /// become reachable from a question that names none of them.
+    ///
+    /// Scoring is deliberately simple and explainable: a term matched in
+    /// the identifier counts double a term matched only in its doc
+    /// comment, because a name is what the author chose to call the
+    /// thing. Ties break on kind then position, so the result is stable.
+    pub fn search_by_terms(&self, terms: &[String]) -> Vec<&Symbol> {
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(usize, usize, usize)> = Vec::new();
+        for (position, symbol) in self.symbols.iter().enumerate() {
+            let name_terms = orbit_project::content_terms(&symbol.name);
+            let doc_terms = orbit_project::content_terms(&symbol.docs);
+
+            let name_hits = terms.iter().filter(|t| name_terms.contains(t)).count();
+            let doc_hits = terms
+                .iter()
+                .filter(|t| doc_terms.contains(t) && !name_terms.contains(t))
+                .count();
+            let score = name_hits * 2 + doc_hits;
+            if score == 0 {
+                continue;
+            }
+
+            // Behavior lives in code that runs. A `mod` matching a term
+            // says only that the module is named for the subject, which
+            // the path generator already reports.
+            let kind_rank = match symbol.kind {
+                SymbolKind::Fn => 0,
+                SymbolKind::Enum | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Type => 1,
+                SymbolKind::Const | SymbolKind::Static => 2,
+                SymbolKind::Impl => 3,
+                SymbolKind::Mod => 4,
+            };
+            scored.push((score, kind_rank, position));
+        }
+
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| self.symbols[a.2].path.cmp(&self.symbols[b.2].path))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        scored
+            .into_iter()
+            .map(|(_, _, position)| &self.symbols[position])
+            .collect()
+    }
+
+    /// The smallest symbol whose span contains `line` in `path`.
+    ///
+    /// Maps a line of code back to the function that runs it. A
+    /// cancellation *check* is a line inside a body -- `if
+    /// cancel.is_cancelled() { ... }` -- and quoting that line alone
+    /// explains nothing; quoting the function it guards explains the
+    /// mechanism.
+    pub fn enclosing(&self, path: &Path, line: usize) -> Option<&Symbol> {
+        self.symbols
+            .iter()
+            .filter(|s| {
+                s.path == path
+                    && s.line_start <= line
+                    && s.line_end >= line
+                    // An `impl` block or `mod` encloses everything in it,
+                    // which makes it the least informative answer to
+                    // "which code does this".
+                    && !matches!(s.kind, SymbolKind::Impl | SymbolKind::Mod)
+            })
+            .min_by_key(|s| s.line_end - s.line_start)
+    }
+
+    /// Whether the index declares `name` anywhere.
+    ///
+    /// Used to tell a symbol this repository actually defines from one a
+    /// model invented while filling a gap in its evidence.
+    pub fn declares(&self, name: &str) -> bool {
+        self.by_exact.contains_key(name)
+    }
+
+    /// Every symbol declared in `path`.
+    pub fn in_file(&self, path: &Path) -> Vec<&Symbol> {
+        self.symbols.iter().filter(|s| s.path == path).collect()
+    }
+
     /// Every symbol matching `query`, definitions first.
     ///
     /// Exact-case matches are preferred over normalized ones, and within
@@ -302,7 +397,14 @@ fn collect_items(items: &[syn::Item], module_path: &mut Vec<String>, out: &mut V
                     module_path.push(name);
                     for impl_item in &i.items {
                         if let syn::ImplItem::Fn(method) = impl_item {
-                            let (line_start, line_end) = span_lines(method.sig.span());
+                            // The method's *whole* span, body included.
+                            // Indexing only the signature made it
+                            // impossible to map a line of code back to
+                            // the method that runs it, so a cancellation
+                            // check inside a body was invisible to
+                            // `enclosing` and a behavior question could
+                            // never reach the code performing it.
+                            let (line_start, line_end) = span_lines(method.span());
                             out.push(Symbol {
                                 name: method.sig.ident.to_string(),
                                 kind: SymbolKind::Fn,

@@ -25,6 +25,14 @@ pub enum RetrievalIntent {
     SymbolExplanation,
     /// "Explain the session architecture" — how a subsystem fits together.
     ArchitectureExplanation,
+    /// "How is cancellation checked during streaming?" — a question about
+    /// a *mechanism*, naming no type.
+    ///
+    /// Distinct from `ArchitectureExplanation`, which asks how parts fit
+    /// together and is answered by documentation. A behavior question is
+    /// answered by the code that runs: the check, the loop, the event
+    /// emitted. Answering it from prose is what produced an invented API.
+    BehaviorExplanation,
     /// "Where is the watchdog implemented?"
     ImplementationLocation,
     /// "Does it satisfy the requirement?"
@@ -194,6 +202,29 @@ const LOCATION_MARKERS: &[&str] = &[
     "onde está",
     "onde fica",
 ];
+/// Phrases asking how something *happens*, as opposed to how it is
+/// arranged. "How is X checked", "what happens when", "when does X run".
+/// These are answered by control flow, not by an overview.
+const BEHAVIOR_MARKERS: &[&str] = &[
+    "how is",
+    "how are",
+    "how does",
+    "how do",
+    "what happens",
+    "when is",
+    "when are",
+    "when does",
+    "checked",
+    "handled",
+    "enforced",
+    "triggered",
+    "propagated",
+    "released",
+    "during",
+    "como funciona",
+    "o que acontece",
+    "quando",
+];
 const ARCHITECTURE_MARKERS: &[&str] = &[
     "architecture",
     "design",
@@ -207,6 +238,18 @@ const ARCHITECTURE_MARKERS: &[&str] = &[
     "overview",
     "arquitetura",
     "fluxo",
+];
+
+/// Words naming a structure rather than a process. A question carrying
+/// one is about how parts are arranged, so it stays an architecture
+/// question even when phrased as "how does ... work".
+const STRUCTURAL_MARKERS: &[&str] = &[
+    "architecture",
+    "arquitetura",
+    "layout",
+    "structure",
+    "overview",
+    "fits together",
 ];
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -329,6 +372,17 @@ fn classify(question_lower: &str, has_entity: bool) -> RetrievalIntent {
     if contains_any(question_lower, LOCATION_MARKERS) {
         return RetrievalIntent::ImplementationLocation;
     }
+    // A behavior question without a named type is the case that used to
+    // fall through to `ArchitectureExplanation` and be answered from
+    // documentation. Checked before the architecture markers because
+    // "how does" appears in both lists: a question containing it is
+    // asking about a mechanism unless it also names a structural word.
+    if !has_entity
+        && contains_any(question_lower, BEHAVIOR_MARKERS)
+        && !contains_any(question_lower, STRUCTURAL_MARKERS)
+    {
+        return RetrievalIntent::BehaviorExplanation;
+    }
     if has_entity {
         // "How does SessionRuntime cancel a turn" is about the subsystem
         // around a named type; "Explain SessionRuntime" is about the type.
@@ -346,6 +400,13 @@ fn classify(question_lower: &str, has_entity: bool) -> RetrievalIntent {
 fn preferred_types(intent: RetrievalIntent) -> Vec<EvidenceType> {
     use EvidenceType::*;
     match intent {
+        // Implementation first, and deliberately ahead of documentation:
+        // a mechanism is described accurately only by the code that runs
+        // it. Documentation still qualifies, but it corroborates rather
+        // than substitutes for the control flow.
+        RetrievalIntent::BehaviorExplanation => {
+            vec![Implementation, Definition, DomainDocumentation, Test]
+        }
         RetrievalIntent::SymbolExplanation => {
             vec![
                 Definition,
@@ -460,7 +521,13 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(plan.intent, RetrievalIntent::ArchitectureExplanation);
+        // A mechanism question, not a structural one: it asks what the
+        // code does, so it must be answered by the code.
+        assert_eq!(plan.intent, RetrievalIntent::BehaviorExplanation);
+        assert_eq!(
+            plan.preferred_evidence_types[0],
+            EvidenceType::Implementation
+        );
         assert!(plan.concepts.contains(&"cancel".to_string()), "{plan:?}");
         assert!(plan.concepts.contains(&"session".to_string()), "{plan:?}");
     }

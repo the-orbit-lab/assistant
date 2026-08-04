@@ -20,11 +20,17 @@ use crate::candidate::{
     Candidate, Corpus, context_candidates, heading_candidates, lexical_candidates, path_candidates,
     symbol_candidates,
 };
-use crate::evidence::{SpanBudget, SymbolEvidence, extract};
+use crate::evidence::{BehaviorEvidence, SpanBudget, SymbolEvidence, behavior, extract};
 use crate::fusion::{FusedCandidate, fuse};
 use crate::plan::{RetrievalIntent, RetrievalPlan, plan};
 use crate::rerank::{RankedEvidence, rerank};
 use crate::select::{Selection, SelectionLimits, select};
+
+/// How many implementation sites a behavior question may gather.
+///
+/// Bounded so the shape of the answer does not depend on how many places
+/// happen to mention the concept.
+const MAX_BEHAVIOR_SITES: usize = 12;
 
 /// What the caller knows about this turn.
 #[derive(Debug, Default, Clone)]
@@ -212,6 +218,12 @@ pub struct RetrievalOutput {
     pub plan: RetrievalPlan,
     pub selection: Selection,
     pub diagnostics: Diagnostics,
+    /// Implementation sites for a question that names no type.
+    ///
+    /// A behavior question -- "how is cancellation checked during model
+    /// streaming" -- has no declaration to quote. Its answer is the code
+    /// that performs the behavior, found from the question's concepts.
+    pub behavior_evidence: Option<BehaviorEvidence>,
     /// AST-backed evidence for the entity this question named, when the
     /// question names one and the repository declares it.
     ///
@@ -289,6 +301,7 @@ impl Pipeline {
         timings.rerank = started.elapsed();
 
         let symbol_evidence = self.symbol_evidence(&plan);
+        let behavior_evidence = self.behavior_evidence(&plan);
 
         let started = Instant::now();
         let selection = select(&ranked, &plan, limits);
@@ -305,7 +318,36 @@ impl Pipeline {
             plan,
             selection,
             symbol_evidence,
+            behavior_evidence,
         }
+    }
+
+    /// Implementation sites for a behavior question.
+    ///
+    /// Only for the intents that ask what the code *does*. A question
+    /// naming a type is already answered by its declaration, and running
+    /// this as well would spend the budget twice.
+    fn behavior_evidence(&self, plan: &RetrievalPlan) -> Option<BehaviorEvidence> {
+        if plan.intent != RetrievalIntent::BehaviorExplanation {
+            return None;
+        }
+        let files: Vec<(PathBuf, &str)> = self
+            .corpus
+            .files()
+            .iter()
+            .map(|f| (f.path.clone(), f.content.as_str()))
+            .collect();
+        let evidence = behavior(
+            self.corpus.symbols(),
+            &plan.concepts,
+            |path| self.corpus.get(path).map(|f| f.content.as_str()),
+            &files,
+            MAX_BEHAVIOR_SITES,
+        );
+        if evidence.is_empty() {
+            return None;
+        }
+        Some(evidence)
     }
 
     /// Build the AST evidence bundle for the question's entity.

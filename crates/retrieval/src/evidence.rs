@@ -949,3 +949,299 @@ impl Unrelated {
         assert_eq!(ranked[0].name, "b");
     }
 }
+
+/// Implementation spans for a question that names no type.
+///
+/// "How is cancellation checked during model streaming and tool
+/// execution?" names `cancel`, `check`, `stream`, `tool`, `execution` —
+/// concepts. There is no declaration to quote, so the evidence is the
+/// code that *does* those things: the functions, enum variants, and
+/// constants whose names or documentation match, each quoted at its own
+/// span.
+///
+/// This is deliberately general. Nothing here knows what cancellation
+/// is; the same mechanism answers "how are permissions enforced" or
+/// "when is the corpus rebuilt" from the same repository.
+#[derive(Debug, Clone)]
+pub struct BehaviorEvidence {
+    /// The concepts this was built from, for diagnostics.
+    pub concepts: Vec<String>,
+    /// Matching symbols with their spans, best first.
+    pub sites: Vec<BehaviorSite>,
+}
+
+/// One place the repository implements part of the behavior.
+#[derive(Debug, Clone)]
+pub struct BehaviorSite {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub signature: String,
+    pub docs: String,
+    pub span: SourceSpan,
+}
+
+impl BehaviorEvidence {
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty()
+    }
+
+    /// Distinct files the behavior touches.
+    ///
+    /// A mechanism that spans several files is the normal case — a
+    /// cancellation check lives in the provider loop, the tool loop, and
+    /// the permission wait — and an answer drawn from one of them is
+    /// exactly the partial answer this exists to prevent.
+    pub fn files(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.sites.iter().map(|s| s.span.path.clone()).collect();
+        paths.dedup();
+        paths
+    }
+
+    /// The spans to quote, under a budget.
+    ///
+    /// Strict score order, with at most two sites per file. An earlier
+    /// version took one site from each file before revisiting any, which
+    /// spread a cancellation question across eight files and diluted the
+    /// three that actually perform the check — spending the budget on
+    /// breadth the question never asked for. Ranking already knows which
+    /// sites cover the most of the question; the per-file cap only stops
+    /// one file from supplying the whole answer.
+    pub fn budgeted_spans(&self, budget: &SpanBudget) -> Vec<SourceSpan> {
+        let mut spans: Vec<SourceSpan> = Vec::new();
+        let mut remaining = budget.total_lines;
+        let mut per_file: Vec<(PathBuf, usize)> = Vec::new();
+
+        for site in &self.sites {
+            if spans.len() >= budget.max_spans || remaining == 0 {
+                break;
+            }
+            let seen = per_file
+                .iter()
+                .find(|(path, _)| *path == site.span.path)
+                .map(|(_, count)| *count)
+                .unwrap_or(0);
+            if seen >= 2 || spans.contains(&site.span) {
+                continue;
+            }
+
+            let available = budget.max_lines_per_span.min(remaining);
+            if available == 0 {
+                break;
+            }
+            let lines = site.span.line_count().min(available);
+            spans.push(SourceSpan {
+                path: site.span.path.clone(),
+                line_start: site.span.line_start,
+                line_end: site.span.line_start + lines - 1,
+            });
+            remaining -= lines;
+            match per_file
+                .iter_mut()
+                .find(|(path, _)| *path == site.span.path)
+            {
+                Some((_, count)) => *count += 1,
+                None => per_file.push((site.span.path.clone(), 1)),
+            }
+        }
+        spans
+    }
+
+    /// A one-line-per-site summary for diagnostics.
+    pub fn summary(&self) -> String {
+        self.sites
+            .iter()
+            .map(|site| {
+                format!(
+                    "  {} {}  [{}]",
+                    site.kind.as_str(),
+                    site.name,
+                    site.span.locator()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Extract the signature line of a symbol from its file, for display.
+fn site_signature(source: &str, span: &SourceSpan, name: &str) -> String {
+    source
+        .lines()
+        .skip(span.line_start.saturating_sub(1))
+        .take(span.line_count())
+        .find(|line| line.contains(name) && !line.trim_start().starts_with("//"))
+        .map(|line| line.trim().trim_end_matches('{').trim().to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Words that make a line a decision rather than a mention.
+///
+/// "Where is cancellation checked" is asking for a branch, a loop, or an
+/// early return — not for every line containing the word.
+const CONTROL_FLOW: &[&str] = &[
+    "if ", "while ", "match ", "return", "break", "continue", "?;", "else",
+];
+
+/// Is this a test symbol?
+///
+/// Structural, matching the reranker's rule: a `tests` directory or a
+/// name saying so. A test named for the behavior it exercises outranks
+/// the implementation on name matching alone, which is how a question
+/// about cancellation filled up with `cancelling_before_an_action_...`.
+fn is_test_symbol(symbol: &crate::symbols::Symbol) -> bool {
+    let name = symbol.name.to_ascii_lowercase();
+    // Rust unit tests live in `#[cfg(test)] mod tests` *inside* the
+    // source file they cover, so the path says nothing -- the enclosing
+    // module is what marks them. Without this, a question about
+    // cancellation fills with `cancelling_before_an_action_prevents_...`,
+    // which is named for the behavior precisely because it tests it.
+    // Test modules are conventionally named for what they cover --
+    // `mod tests`, `mod event_tests`, `mod cancellation_tests` -- so an
+    // exact match on "tests" misses most of them. Matching the suffix
+    // catches the convention without excluding a module that merely
+    // contains the word.
+    let is_test_module = |segment: &String| {
+        let lower = segment.to_ascii_lowercase();
+        lower == "test" || lower.ends_with("test") || lower.ends_with("tests")
+    };
+    let in_test_module = symbol.module_path.iter().any(is_test_module);
+
+    in_test_module
+        || crate::rerank::is_test_path(&symbol.path)
+        || name.starts_with("test_")
+        || name.ends_with("_test")
+        || name.ends_with("_tests")
+}
+
+/// Functions containing a control-flow line that matches the concepts.
+///
+/// This is what finds the *check itself*. A cancellation guard is a line
+/// inside a body, so it is invisible to name and doc matching; mapping
+/// the line back to its enclosing function through the symbol index is
+/// what turns "this file mentions cancel" into "this function decides
+/// on cancellation".
+fn control_flow_sites<'a>(
+    index: &'a crate::symbols::SymbolIndex,
+    concepts: &[String],
+    files: &[(PathBuf, &str)],
+) -> Vec<(usize, &'a crate::symbols::Symbol)> {
+    // Distinct concepts matched anywhere in the function, not raw line
+    // hits: a function that checks cancellation *and* handles streaming
+    // is what "how is cancellation checked during streaming" is asking
+    // for, while one line repeating a single term is not.
+    let mut found: Vec<(Vec<String>, &crate::symbols::Symbol)> = Vec::new();
+    for (path, text) in files {
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        for (index_of_line, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if !CONTROL_FLOW.iter().any(|k| line.contains(k)) {
+                continue;
+            }
+            let terms = orbit_project::content_terms(line);
+            let matched: Vec<String> = concepts
+                .iter()
+                .filter(|t| terms.contains(t))
+                .cloned()
+                .collect();
+            if matched.is_empty() {
+                continue;
+            }
+            let Some(symbol) = index.enclosing(path, index_of_line + 1) else {
+                continue;
+            };
+            // Only code that runs. A line inside an `enum` body maps to
+            // the enum, which answers "what values exist", not "where is
+            // this checked" -- and a type is already reachable by name.
+            if symbol.kind != crate::symbols::SymbolKind::Fn || is_test_symbol(symbol) {
+                continue;
+            }
+            match found.iter_mut().find(|(_, s)| std::ptr::eq(*s, symbol)) {
+                Some((seen, _)) => {
+                    for term in matched {
+                        if !seen.contains(&term) {
+                            seen.push(term);
+                        }
+                    }
+                }
+                None => found.push((matched, symbol)),
+            }
+        }
+    }
+    found.sort_by(|a, b| {
+        b.0.len()
+            .cmp(&a.0.len())
+            .then_with(|| a.1.path.cmp(&b.1.path))
+            .then_with(|| a.1.line_start.cmp(&b.1.line_start))
+    });
+    found
+        .into_iter()
+        .map(|(matched, symbol)| (matched.len(), symbol))
+        .collect()
+}
+
+/// Build behavior evidence from concept terms.
+///
+/// Two sources, deliberately combined: symbols *named* for the concepts,
+/// and functions that make a *decision* about them. The first finds
+/// `CancellationToken` and `cancel_current_turn`; only the second finds
+/// the loop that checks the token between tool calls, because nothing in
+/// that function's name says it does.
+///
+/// `sources` supplies the text of each file so signatures can be shown
+/// without a second read. Only symbols the index already holds are
+/// considered, so every span points at a discovered file.
+pub fn behavior<'a>(
+    index: &crate::symbols::SymbolIndex,
+    concepts: &[String],
+    sources: impl Fn(&Path) -> Option<&'a str>,
+    files: &[(PathBuf, &str)],
+    max_sites: usize,
+) -> BehaviorEvidence {
+    // Control-flow sites first: they are the answer to "where is this
+    // checked", and a name match is corroboration for them.
+    let mut ordered: Vec<&crate::symbols::Symbol> = control_flow_sites(index, concepts, files)
+        .into_iter()
+        .map(|(_, symbol)| symbol)
+        .collect();
+
+    for symbol in index.search_by_terms(concepts) {
+        if is_test_symbol(symbol) {
+            continue;
+        }
+        if !ordered.iter().any(|s| std::ptr::eq(*s, symbol)) {
+            ordered.push(symbol);
+        }
+    }
+
+    let sites = ordered
+        .into_iter()
+        .take(max_sites)
+        .map(|symbol| {
+            let span = SourceSpan {
+                path: symbol.path.clone(),
+                line_start: symbol.line_start,
+                line_end: symbol.line_end,
+            };
+            let signature = sources(&symbol.path)
+                .map(|text| site_signature(text, &span, &symbol.name))
+                .unwrap_or_else(|| symbol.signature());
+            BehaviorSite {
+                name: symbol.name.clone(),
+                kind: symbol.kind,
+                signature,
+                docs: symbol.docs.clone(),
+                span,
+            }
+        })
+        .collect();
+
+    BehaviorEvidence {
+        concepts: concepts.to_vec(),
+        sites,
+    }
+}

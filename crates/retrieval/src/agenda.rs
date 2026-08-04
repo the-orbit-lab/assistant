@@ -25,6 +25,19 @@ use crate::pipeline::{Pipeline, PipelineInput, RetrievalOutput};
 use crate::plan::EvidenceType;
 use crate::select::SelectionLimits;
 
+/// Span budget for a behavior question.
+///
+/// Wider than the symbol budget and with a smaller per-span cap: a
+/// mechanism is spread across several call sites, and what matters is
+/// seeing each of them, not seeing any one of them in full.
+const BEHAVIOR_BUDGET: SpanBudget = SpanBudget {
+    // Five sites is enough to show a mechanism end to end. More than
+    // that and the sites that actually perform it stop standing out.
+    max_spans: 5,
+    max_lines_per_span: 40,
+    total_lines: 180,
+};
+
 /// How many whole files to read when there is no symbol bundle.
 pub const MAX_WHOLE_FILE_READS: usize = 3;
 /// How many to read when there is one.
@@ -56,6 +69,11 @@ pub struct EvidenceAgenda {
     /// Everything the selector chose, with its type, for diagnostics and
     /// for tests that assert on ordering.
     pub selected: Vec<PlannedRead>,
+    /// Every symbol name this project declares.
+    ///
+    /// Used after the answer to tell an invented API from a real one:
+    /// a name absent from here cannot have come from the evidence.
+    pub declared_symbols: std::collections::HashSet<String>,
 }
 
 impl EvidenceAgenda {
@@ -92,18 +110,70 @@ pub fn build(
     from_output(pipeline, output)
 }
 
-/// Build the agenda from an already-computed pipeline run.
-pub fn from_output(pipeline: &Pipeline, output: RetrievalOutput) -> EvidenceAgenda {
-    let symbol_spans = output
-        .symbol_evidence
-        .as_ref()
-        .map(|evidence| {
-            evidence.budgeted_spans(
-                &output.plan.terms_about(&evidence.name),
-                &SpanBudget::default(),
+/// A trusted instruction naming where the entity is declared.
+fn symbol_anchor(output: &RetrievalOutput) -> Option<String> {
+    let evidence = output.symbol_evidence.as_ref()?;
+    Some(format!(
+        "The repository declares `{}` as a {} at {}:{}-{}, with {} field(s) and {} \
+         method(s). That declaration is the definition of `{}`; explain it and its \
+         fields directly. Do not describe the tests that exercise it, and do not \
+         substitute a general overview of the surrounding subsystem for the type itself.",
+        evidence.name,
+        evidence.kind.as_str(),
+        evidence.definition.path.display(),
+        evidence.definition.line_start,
+        evidence.definition.line_end,
+        evidence.fields.len(),
+        evidence.method_count(),
+        evidence.name,
+    ))
+}
+
+/// A trusted instruction listing the implementation sites a behavior
+/// question retrieved.
+///
+/// Naming them explicitly is what stops the model filling a gap with a
+/// plausible API: it is told which code implements the behavior, and
+/// told that anything else it might name is not in evidence.
+fn behavior_anchor(output: &RetrievalOutput) -> Option<String> {
+    let evidence = output.behavior_evidence.as_ref()?;
+    let sites: Vec<String> = evidence
+        .sites
+        .iter()
+        .take(8)
+        .map(|site| {
+            format!(
+                "{} `{}` at {}",
+                site.kind.as_str(),
+                site.name,
+                site.span.locator()
             )
         })
-        .unwrap_or_default();
+        .collect();
+
+    Some(format!(
+        "This question is about behavior, and the repository implements it here: {}. \
+         Explain the mechanism from the quoted code only. Every field, method, type, \
+         event, or variant you name must appear in the quoted evidence; if the \
+         evidence does not show a part of the mechanism, say that part was not found \
+         rather than describing how such code is usually written.",
+        sites.join("; ")
+    ))
+}
+
+/// Build the agenda from an already-computed pipeline run.
+pub fn from_output(pipeline: &Pipeline, output: RetrievalOutput) -> EvidenceAgenda {
+    // A question names a type, or it names a behavior. Either way the
+    // evidence is code quoted at exact spans; only the way those spans
+    // are found differs.
+    let symbol_spans = match (&output.symbol_evidence, &output.behavior_evidence) {
+        (Some(evidence), _) => evidence.budgeted_spans(
+            &output.plan.terms_about(&evidence.name),
+            &SpanBudget::default(),
+        ),
+        (None, Some(evidence)) => evidence.budgeted_spans(&BEHAVIOR_BUDGET),
+        (None, None) => Vec::new(),
+    };
 
     let quoted: Vec<PathBuf> = symbol_spans.iter().map(|s| s.path.clone()).collect();
     let budget = if symbol_spans.is_empty() {
@@ -155,28 +225,17 @@ pub fn from_output(pipeline: &Pipeline, output: RetrievalOutput) -> EvidenceAgen
         }
     }
 
-    let anchor = output.symbol_evidence.as_ref().map(|evidence| {
-        format!(
-            "The repository declares `{}` as a {} at {}:{}-{}, with {} field(s) and {} \
-             method(s). That declaration is the definition of `{}`; explain it and its \
-             fields directly. Do not describe the tests that exercise it, and do not \
-             substitute a general overview of the surrounding subsystem for the type itself.",
-            evidence.name,
-            evidence.kind.as_str(),
-            evidence.definition.path.display(),
-            evidence.definition.line_start,
-            evidence.definition.line_end,
-            evidence.fields.len(),
-            evidence.method_count(),
-            evidence.name,
-        )
-    });
+    let anchor = behavior_anchor(&output).or_else(|| symbol_anchor(&output));
 
     let source = output
         .symbol_evidence
         .as_ref()
         .and_then(|evidence| pipeline.corpus().get(&evidence.definition.path))
         .map(|file| file.content.clone());
+    let behavior_summary = output
+        .behavior_evidence
+        .as_ref()
+        .map(|evidence| evidence.summary());
 
     let selected: Vec<PlannedRead> = output
         .selection
@@ -195,6 +254,11 @@ pub fn from_output(pipeline: &Pipeline, output: RetrievalOutput) -> EvidenceAgen
         source.as_deref(),
         8,
     );
+    if let Some(summary) = &behavior_summary {
+        diagnostics.push_str("behavior sites:\n");
+        diagnostics.push_str(summary);
+        diagnostics.push('\n');
+    }
     diagnostics.push_str("progressive reads (whole file, in order):\n");
     for read in &reads {
         diagnostics.push_str(&format!(
@@ -219,6 +283,13 @@ pub fn from_output(pipeline: &Pipeline, output: RetrievalOutput) -> EvidenceAgen
         anchor,
         diagnostics: Some(diagnostics),
         selected,
+        declared_symbols: pipeline
+            .corpus()
+            .symbols()
+            .symbols()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect(),
     }
 }
 

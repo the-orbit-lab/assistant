@@ -107,7 +107,7 @@ impl RankedEvidence {
 /// `tests/` directory by convention, and unit-test modules live in files
 /// whose own name says so. This classifies evidence; it never excludes a
 /// file, because "how is this tested?" is a real question.
-fn is_test_path(path: &Path) -> bool {
+pub fn is_test_path(path: &Path) -> bool {
     path.components().any(|c| {
         let text = c.as_os_str().to_string_lossy().to_ascii_lowercase();
         text == "tests" || text == "test"

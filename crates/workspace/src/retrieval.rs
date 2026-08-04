@@ -204,6 +204,9 @@ pub struct RetrievalOutcome {
     pub records: Vec<ExecutionRecord>,
     /// Terms actually searched for, for `--verbose` diagnostics.
     pub terms: Vec<String>,
+    /// Every symbol the selected projects declare, so an answer naming
+    /// one they do not can be flagged rather than presented as fact.
+    pub declared_symbols: HashSet<String>,
 }
 
 impl RetrievalOutcome {
@@ -287,6 +290,7 @@ pub async fn run(
             sources,
             records,
             terms: Vec::new(),
+            declared_symbols: HashSet::new(),
         };
     }
 
@@ -318,6 +322,7 @@ pub async fn run(
     let analysis = analyze_question(question, &bounded_scope, project_registry, context_terms);
     let terms = analysis.all_terms();
     let mut any_evidence = false;
+    let mut declared_symbols: HashSet<String> = HashSet::new();
 
     // The same evidence planner the single-project path uses. This
     // module previously ran `workspace.search` and read whatever it
@@ -344,6 +349,7 @@ pub async fn run(
                 continue;
             }
             any_evidence = true;
+            declared_symbols.extend(agenda.declared_symbols.iter().cloned());
             orbit_retrieval::agenda::trace(&agenda, "orbit-retrieval pipeline", Some(project));
             if let Some(report) = &agenda.diagnostics {
                 tracing::debug!(project = %project, "evidence selection:\n{report}");
@@ -436,6 +442,7 @@ pub async fn run(
         sources,
         records,
         terms,
+        declared_symbols,
     }
 }
 

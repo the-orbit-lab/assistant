@@ -11,6 +11,7 @@ pub mod prompt;
 pub mod retrieval;
 pub mod session;
 
+pub use agent::dedupe_sources;
 pub use agent::{Agent, AgentOutcome, DEFAULT_MAX_ITERATIONS, DEFAULT_REQUEST_TIMEOUT};
 pub use retrieval::is_broad_overview_question;
 pub use session::build_registry;

@@ -50,6 +50,8 @@ pub struct RetrievalOutcome {
     pub records: Vec<ExecutionRecord>,
     /// Terms actually searched for, for `--verbose` diagnostics.
     pub terms: Vec<String>,
+    /// Every symbol this project declares, for grounding validation.
+    pub declared_symbols: std::collections::HashSet<String>,
     /// How the evidence pipeline reached its selection, for `--verbose`.
     ///
     /// Structural only -- paths, evidence types, and scores. No file is
@@ -276,6 +278,7 @@ pub async fn run(
         sources,
         records,
         terms,
+        declared_symbols: agenda.declared_symbols,
         diagnostics,
     }
 }

@@ -26,6 +26,7 @@ pub mod agenda;
 pub mod candidate;
 pub mod evidence;
 pub mod fusion;
+pub mod grounding;
 pub mod pipeline;
 pub mod plan;
 pub mod rerank;

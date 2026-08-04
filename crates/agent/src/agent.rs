@@ -45,6 +45,9 @@ pub struct Agent {
     events: EventEmitter,
     cancel: CancellationToken,
     streaming: bool,
+    /// Supplied by a caller that ran retrieval itself, so grounding
+    /// validation works on the workspace path too.
+    declared_symbols: std::collections::HashSet<String>,
 }
 
 impl Agent {
@@ -66,7 +69,19 @@ impl Agent {
             events: EventEmitter::null(),
             cancel: CancellationToken::new(),
             streaming: false,
+            declared_symbols: std::collections::HashSet::new(),
         }
+    }
+
+    /// Every symbol the project(s) in scope declare.
+    ///
+    /// A workspace-scoped caller runs its own retrieval and disables this
+    /// agent's, so without this the agent has no index to check an answer
+    /// against and invented symbols go unflagged on exactly the path
+    /// `orbit chat` uses.
+    pub fn with_declared_symbols(mut self, symbols: std::collections::HashSet<String>) -> Self {
+        self.declared_symbols = symbols;
+        self
     }
 
     pub fn with_max_iterations(mut self, max_iterations: u32) -> Self {
@@ -173,6 +188,9 @@ impl Agent {
 
         let mut sources = Vec::new();
         let mut records = Vec::new();
+        // Every symbol this project declares, so an answer naming one it
+        // does not can be flagged rather than presented as fact.
+        let mut declared_symbols = self.declared_symbols.clone();
 
         // Ground the question before the model sees it, always -- not
         // only for broad "what does this do" questions.
@@ -219,6 +237,7 @@ impl Agent {
             if confidence.needs_grounding_warning() {
                 history.push(Message::system(crate::prompt::grounding_notice(confidence)));
             }
+            declared_symbols = retrieved.declared_symbols;
             sources.extend(retrieved.sources);
             records.extend(retrieved.records);
         }
@@ -311,7 +330,7 @@ impl Agent {
                 "agent run finished"
             );
             return Ok(AgentOutcome {
-                answer: response.message.content,
+                answer: flag_unknown_symbols(response.message.content, &declared_symbols),
                 sources,
                 records,
                 cancelled: false,
@@ -396,7 +415,39 @@ impl Agent {
 /// real `ActionOutput::sources` returned by executed actions (see `run`
 /// above) -- the model's own answer text never contributes an entry, so it
 /// cannot invent a source path that nothing was actually retrieved from.
-fn dedupe_sources(sources: Vec<SourceReference>) -> Vec<SourceReference> {
+/// Append a warning when the answer named symbols this repository does
+/// not declare.
+///
+/// Retrieval can put the right evidence in front of a model and the
+/// model can still fill a gap with a plausible API — the reported case
+/// invented `start_session()` and `handle_request()` on a type that has
+/// neither. A name absent from the project's own symbol index cannot
+/// have come from the evidence, so it was invented, and saying so is a
+/// statement about the text rather than a judgment about the model.
+///
+/// Flagged rather than removed: the rest of the answer may be sound, and
+/// silently deleting sentences would leave something that reads as fully
+/// grounded when part of it was not.
+fn flag_unknown_symbols(answer: String, declared: &std::collections::HashSet<String>) -> String {
+    // With no index there is nothing to check against, and flagging
+    // everything would be worse than flagging nothing.
+    if declared.is_empty() {
+        return answer;
+    }
+    let unknown = orbit_retrieval::grounding::unknown_symbols(&answer, declared);
+    match orbit_retrieval::grounding::unknown_symbol_notice(&unknown) {
+        Some(notice) => {
+            tracing::debug!(
+                unknown = ?unknown.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+                "answer named symbols the repository does not declare"
+            );
+            answer + &notice
+        }
+        None => answer,
+    }
+}
+
+pub fn dedupe_sources(sources: Vec<SourceReference>) -> Vec<SourceReference> {
     let has_line_range: std::collections::HashSet<&std::path::PathBuf> = sources
         .iter()
         .filter(|s| s.line_start.is_some())

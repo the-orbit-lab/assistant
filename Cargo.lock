@@ -1084,6 +1084,7 @@ dependencies = [
  "orbit-mcp-client",
  "orbit-project",
  "orbit-providers",
+ "orbit-retrieval",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1095,6 +1096,7 @@ name = "orbit-cli"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "orbit-actions",
  "orbit-agent",
@@ -1102,8 +1104,10 @@ dependencies = [
  "orbit-mcp-server",
  "orbit-project",
  "orbit-providers",
+ "orbit-session",
  "orbit-workspace",
  "predicates",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1115,6 +1119,7 @@ dependencies = [
 name = "orbit-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "thiserror",
@@ -1174,6 +1179,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-retrieval"
+version = "0.1.0"
+dependencies = [
+ "orbit-core",
+ "orbit-project",
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "orbit-session"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "orbit-actions",
+ "orbit-agent",
+ "orbit-core",
+ "orbit-project",
+ "orbit-providers",
+ "orbit-workspace",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "orbit-workspace"
 version = "0.1.0"
 dependencies = [
@@ -1181,6 +1218,7 @@ dependencies = [
  "orbit-actions",
  "orbit-core",
  "orbit-project",
+ "orbit-retrieval",
  "serde",
  "serde_json",
  "serde_norway",

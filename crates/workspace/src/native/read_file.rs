@@ -16,6 +16,18 @@ struct Input {
     path: String,
     #[serde(default)]
     max_bytes: Option<u64>,
+    #[serde(default)]
+    truncate: bool,
+    /// First line to return, 1-indexed and inclusive.
+    ///
+    /// Passed straight through to the project's own `project.read_file`,
+    /// so the range is applied after that project's security checks and
+    /// can only ever narrow what the caller was already allowed to see.
+    #[serde(default)]
+    line_start: Option<usize>,
+    /// Last line to return, 1-indexed and inclusive.
+    #[serde(default)]
+    line_end: Option<usize>,
 }
 
 pub struct WorkspaceReadFileAction {
@@ -37,7 +49,21 @@ impl Action for WorkspaceReadFileAction {
                 "properties": {
                     "project": { "type": "string", "description": "Registered project name or alias" },
                     "path": { "type": "string", "description": "Path relative to that project's own root" },
-                    "max_bytes": { "type": "integer", "minimum": 1 }
+                    "max_bytes": { "type": "integer", "minimum": 1 },
+                    "truncate": {
+                        "type": "boolean",
+                        "description": "Return the first max_bytes instead of failing when the file is larger."
+                    },
+                    "line_start": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First line to return, 1-indexed and inclusive."
+                    },
+                    "line_end": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Last line to return, 1-indexed and inclusive."
+                    }
                 },
                 "required": ["project", "path"],
                 "additionalProperties": false
@@ -78,7 +104,13 @@ impl Action for WorkspaceReadFileAction {
             .call_project_action(
                 entry,
                 read_file::NAME,
-                json!({ "path": parsed.path, "max_bytes": max_bytes }),
+                json!({
+                    "path": parsed.path,
+                    "max_bytes": max_bytes,
+                    "truncate": parsed.truncate,
+                    "line_start": parsed.line_start,
+                    "line_end": parsed.line_end,
+                }),
             )
             .await?;
 
@@ -97,6 +129,9 @@ impl Action for WorkspaceReadFileAction {
             "project": entry.name,
             "path": output.data["path"],
             "size": output.data["size"],
+            "truncated": output.data["truncated"],
+            "line_start": output.data["line_start"],
+            "line_end": output.data["line_end"],
             "content": output.data["content"],
             "sources": workspace_sources,
         }))

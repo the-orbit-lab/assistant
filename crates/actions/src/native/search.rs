@@ -90,12 +90,28 @@ impl Action for SearchAction {
                     "section": r.source.section,
                     "excerpt": r.excerpt,
                     "score": r.score,
+                    // Why this result ranked where it did. Structural
+                    // only -- no file content beyond the excerpt above.
+                    "score_components": {
+                        "lexical": r.components.lexical,
+                        "coverage": r.components.coverage,
+                        "filename": r.components.filename,
+                        "path": r.components.path,
+                        "heading": r.components.heading,
+                        "symbol": r.components.symbol,
+                        "phrase": r.components.phrase,
+                        "matched_terms": r.components.matched_terms,
+                    },
                 })
             })
             .collect();
 
         Ok(ActionOutput::new(json!({
             "query": parsed.query,
+            // The terms actually searched for, after tokenization and
+            // filler removal -- the single most useful thing to see when
+            // a search returns something unexpected.
+            "terms": orbit_project::content_terms(&parsed.query),
             "count": entries.len(),
             "results": entries,
         }))

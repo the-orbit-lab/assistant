@@ -28,8 +28,10 @@ This is a working first version, not a prototype with placeholders: every
 command below runs end-to-end against real project files and a real local
 Ollama instance, and the MCP server has been exercised against a real MCP
 client over the wire protocol. What's *not* built yet: Anthropic/OpenAI
-providers, a desktop or voice interface, persistent conversation memory,
-and vector search — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#what-is-not-built-yet)
+providers, the desktop and voice interfaces themselves (their foundation —
+stateful sessions, a structured event stream, streaming responses,
+structured permissions, cancellation, and a JSON Lines bridge — *is*
+built), persistent conversation memory, and vector search — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#what-is-not-built-yet)
 and [ADR 0001](docs/architecture/0001-scope-deviation-from-project-spec.md)
 for the reasoning.
 
@@ -72,15 +74,16 @@ orbit ask "What does this project do?"
 | `orbit init` | Create `.orbit/project.yaml` (`--force` to overwrite). |
 | `orbit project` | Show name, root, provider, commands, effective permissions, MCP config. |
 | `orbit files` | List every file the config allows Orbit to see. |
-| `orbit search <query>` | Deterministic local search — no model involved. |
+| `orbit search <query>` | Deterministic local lexical search (BM25) — no model involved. `--verbose` explains the ranking. |
 | `orbit ask <question>` | One agent turn: model + tools, answer + sources. |
 | `orbit commands` | List configured commands and their required permission. |
 | `orbit run <name>` | Run one configured command (permission-checked). |
 | `orbit doctor` | Check config, Ollama connectivity, model availability, file discovery, MCP exposure and server initialization. |
-| `orbit chat` | Multi-turn session; history lives in memory only. |
+| `orbit chat` | Stateful multi-turn session: streaming answers, live action status, project switching, permission prompts, cancellation. History lives in memory only. |
 | `orbit mcp serve` | Serve this project's (or, with `--workspace`, workspace's) exposed actions over MCP stdio. |
 | `orbit workspace` | Show workspace info; `orbit workspace init` to create one. |
 | `orbit projects` | List every project registered in the active workspace. |
+| `orbit app serve --jsonl` | Drive sessions over a JSON Lines protocol, for a desktop or voice front end. |
 
 Global flags: `--project <name-or-dir>` (a registered project name/alias
 when a workspace is active, or always a filesystem path), `--workspace
@@ -108,6 +111,47 @@ orbit ask "Compare the documented STM32 decision with the OBC implementation."
 See [docs/WORKSPACES.md](docs/WORKSPACES.md) for directory layout,
 `.orbit/workspace.yaml`, discovery precedence, natural-language project
 routing, permission isolation between projects, and workspace MCP mode.
+
+## Sessions
+
+`orbit chat` is a stateful session: it remembers the conversation, the
+active project(s), every action it ran, and every source it collected, for
+as long as the process lives. Inside a session:
+
+```text
+/projects        list the projects registered in this workspace
+/use <a[,b]>     set the active project(s)
+/status          show session id, mode, active projects, counters
+/sources         re-print the sources collected in this session
+/cancel          cancel the turn currently running (or press Ctrl-C)
+/clear           forget the conversation, keep the session
+/help            show this list
+/exit            end the session
+```
+
+Answers stream as they are generated, actions report as they run, and an
+`ask` permission pauses the turn until you answer it. Commands are handled
+by Orbit itself and are never sent to the model. Nothing is written to
+disk — closing the process discards the conversation.
+
+See [docs/SESSIONS.md](docs/SESSIONS.md).
+
+## Building a front end
+
+Every interface — the terminal, a future desktop app, a future voice
+interface — observes the same structured [Agent Event
+Stream](docs/EVENTS.md): session and turn lifecycle, deterministic
+retrieval, action start/finish, permission requests, per-project source
+citations, streamed response deltas, and cancellation.
+
+```bash
+orbit app serve --jsonl
+```
+
+speaks that stream over stdin/stdout as newline-delimited JSON, so a GUI
+never reimplements agent logic. See
+[docs/APP_PROTOCOL.md](docs/APP_PROTOCOL.md) for the commands, the frames,
+and notes for a SwiftUI client.
 
 ## MCP
 
@@ -150,11 +194,19 @@ details in [docs/SECURITY.md](docs/SECURITY.md).
 - Duplicate YAML mapping keys in `.orbit/project.yaml` are not detected as
   a config error (standard YAML last-value-wins behavior).
 - `orbit chat` history is in-process only; nothing is persisted to disk.
-- Local search is filename/heading/content matching with simple ranking —
-  no embeddings, no vector database.
+- Retrieval is deterministic: BM25 over normalized tokens, a `syn`-built
+  Rust symbol index, path/heading signals, rank fusion, and
+  evidence-quality reranking — no embeddings, no vector database, and no
+  semantic matching. The symbol index is Rust-only. See
+  [docs/SEARCH.md](docs/SEARCH.md#known-limitations).
 - Workspace project routing (both natural-language scanning and
   name/alias resolution) is deterministic text matching, not semantic —
   see [docs/WORKSPACES.md](docs/WORKSPACES.md#known-limitations).
+- Sessions are in-memory only; there is no persistent conversation
+  memory, and a session runs one turn at a time.
+- The desktop and voice interfaces are not built. Their foundation —
+  sessions, events, streaming, structured permissions, cancellation, and
+  the JSONL bridge — is.
 
 ## Development
 

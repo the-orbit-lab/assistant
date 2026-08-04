@@ -101,7 +101,7 @@ async fn run_workspace(
         )),
         orbit_core::Message::user(question),
     ];
-    let (scope, sources, records) = orbit_workspace::retrieval::run(
+    let retrieved = orbit_workspace::retrieval::run(
         &registry,
         &action_ctx,
         &project_registry,
@@ -109,8 +109,22 @@ async fn run_workspace(
         question,
         explicit_projects.as_deref(),
         &mut history,
+        // `orbit ask` is a one-shot command with no event consumer; a
+        // null emitter keeps the retrieval path identical either way.
+        &orbit_core::EventEmitter::null(),
+        // One-shot: there is no earlier turn to draw context from.
+        &[],
     )
     .await;
+    let confidence = retrieved.confidence();
+    let scope = retrieved.scope.clone();
+    let sources = retrieved.sources;
+    let records = retrieved.records;
+    if confidence.needs_grounding_warning() {
+        history.push(orbit_core::Message::system(
+            orbit_agent::prompt::grounding_notice(confidence),
+        ));
+    }
 
     let model = global
         .model
@@ -123,7 +137,7 @@ async fn run_workspace(
     let provider = Arc::new(OllamaProvider::new(endpoint, model));
 
     let agent = Agent::new(provider, registry, Arc::new(action_ctx), confirmation)
-        .with_builtin_overview_retrieval(false);
+        .with_builtin_retrieval(false);
 
     let mut agent_sources = sources;
     let mut agent_records = records;

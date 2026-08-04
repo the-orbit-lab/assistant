@@ -16,62 +16,25 @@
 use std::collections::HashSet;
 
 use orbit_actions::{ActionContext, ActionRegistry};
-use orbit_core::{ConfirmationProvider, ExecutionRecord, Message, SourceReference, ToolCall};
+use orbit_core::{
+    ConfirmationProvider, EventEmitter, EventPayload, ExecutionRecord, Message,
+    RetrievalConfidence, SourceReference, ToolCall,
+};
+use orbit_retrieval::agenda::EvidenceAgenda;
+use orbit_retrieval::pipeline::{Pipeline, PipelineInput};
+use orbit_retrieval::select::SelectionLimits;
 use serde_json::{Value, json};
 
 use crate::budget::MAX_PROJECTS_PER_REQUEST;
 use crate::config::normalize_identifier;
 use crate::registry::ProjectRegistry;
 
-const STOPWORDS: &[&str] = &[
-    "a",
-    "an",
-    "and",
-    "the",
-    "is",
-    "are",
-    "was",
-    "were",
-    "do",
-    "does",
-    "did",
-    "what",
-    "which",
-    "how",
-    "why",
-    "in",
-    "on",
-    "of",
-    "for",
-    "with",
-    "about",
-    "regarding",
-    "compare",
-    "comparing",
-    "versus",
-    "vs",
-    "between",
-    "project",
-    "projects",
-    "this",
-    "that",
-    "explain",
-    "describe",
-    "tell",
-    "me",
-    "documented",
-    "decision",
-    "decisions",
-    "implementation",
-    "implementations",
-];
-
 /// Which project(s) a question resolved to, and whether that came from an
 /// explicit selector, an exact name/alias mention in the text, or the
 /// workspace's configured default -- the caller uses this to say plainly
 /// which project(s) were used, per "the selected project must be visible
 /// in the response."
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedScope {
     /// Empty means workspace-level only: no specific project.
     pub projects: Vec<String>,
@@ -143,46 +106,9 @@ pub fn find_project_mentions(question: &str, registry: &ProjectRegistry) -> Vec<
     found
 }
 
-/// Deterministic keyword extraction: strip the scoped projects' own
-/// names/aliases and a fixed stopword list, keep what's left. Not
-/// semantic, not fuzzy -- just enough to turn "Compare docs and OBC
-/// regarding STM32 selection" into a `project.search` query of `STM32
-/// selection` instead of dumping each project's README.
-fn extract_search_query(
-    question: &str,
-    scope_names: &[String],
-    registry: &ProjectRegistry,
-) -> Option<String> {
-    let mut exclude: HashSet<String> = HashSet::new();
-    for name in scope_names {
-        if let Ok(entry) = registry.resolve_project(name) {
-            exclude.insert(normalize_identifier(&entry.name));
-            for alias in &entry.aliases {
-                for word in alias.split_whitespace() {
-                    exclude.insert(normalize_identifier(word));
-                }
-            }
-        }
-    }
-
-    let significant: Vec<&str> = question
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .filter(|w| {
-            let normalized = normalize_identifier(w);
-            w.len() > 1
-                && !STOPWORDS.contains(&normalized.as_str())
-                && !exclude.contains(&normalized)
-        })
-        .collect();
-
-    if significant.is_empty() {
-        None
-    } else {
-        Some(significant.join(" "))
-    }
-}
-
+/// Which project(s) a question is about. Deterministic throughout: an
+/// explicit selection, else an exact name/alias mentioned in the text,
+/// else the workspace default.
 fn resolve_scope(
     question: &str,
     explicit: Option<&[String]>,
@@ -240,11 +166,64 @@ fn score_overview_candidate(path: &str) -> Option<u32> {
 const MAX_OVERVIEW_READS_PER_PROJECT: usize = 2;
 const OVERVIEW_READ_BYTES: u64 = 8_000;
 
+/// Build the evidence agenda for one project in the scope.
+///
+/// Each registered project keeps its own root, its own configuration,
+/// and its own security boundary, so the corpus is discovered per
+/// project rather than merged. A project whose configuration failed to
+/// load contributes nothing instead of failing the turn.
+fn plan_project_evidence(
+    project_registry: &ProjectRegistry,
+    project: &str,
+    question: &str,
+    context_terms: &[String],
+    scope: &[String],
+) -> Option<EvidenceAgenda> {
+    let entry = project_registry.get_project(project)?;
+    let context = entry.action_context().ok()?;
+    let files = orbit_project::discover_files(&context.root, &context.config).ok()?;
+
+    let pipeline = Pipeline::new(files);
+    Some(orbit_retrieval::agenda::build(
+        &pipeline,
+        &PipelineInput {
+            question: question.to_string(),
+            context_terms: context_terms.to_vec(),
+            recent_paths: Vec::new(),
+            target_projects: scope.to_vec(),
+        },
+        &SelectionLimits::default(),
+    ))
+}
+
+/// What one workspace-scoped retrieval step produced.
+#[derive(Debug, Clone, Default)]
+pub struct RetrievalOutcome {
+    pub scope: ResolvedScope,
+    pub sources: Vec<SourceReference>,
+    pub records: Vec<ExecutionRecord>,
+    /// Terms actually searched for, for `--verbose` diagnostics.
+    pub terms: Vec<String>,
+    /// Every symbol the selected projects declare, so an answer naming
+    /// one they do not can be flagged rather than presented as fact.
+    pub declared_symbols: HashSet<String>,
+}
+
+impl RetrievalOutcome {
+    /// Judged on distinct `(project, path)` pairs, so several matches
+    /// inside one document do not look like corroboration.
+    pub fn confidence(&self) -> RetrievalConfidence {
+        let files: HashSet<_> = self.sources.iter().map(|s| s.path.clone()).collect();
+        RetrievalConfidence::from_distinct_files(files.len())
+    }
+}
+
 /// Run the deterministic retrieval step for one workspace-scoped question,
 /// appending synthetic `workspace.*` tool-call/tool-result message pairs
 /// to `history` exactly as a model-initiated call would produce -- through
 /// the same `ActionRegistry::execute`, so permission enforcement and
 /// execution records are identical either way.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     registry: &ActionRegistry,
     action_ctx: &ActionContext,
@@ -253,11 +232,26 @@ pub async fn run(
     question: &str,
     explicit_projects: Option<&[String]>,
     history: &mut Vec<Message>,
-) -> (ResolvedScope, Vec<SourceReference>, Vec<ExecutionRecord>) {
+    events: &EventEmitter,
+    context_terms: &[String],
+) -> RetrievalOutcome {
     let scope = resolve_scope(question, explicit_projects, project_registry);
+    // Which retrieval implementation this run used. Named explicitly
+    // because the reported failure was not a ranking bug -- it was this
+    // path silently running a *different* retrieval from the one every
+    // test exercised, with nothing in the output saying so.
+    tracing::debug!(
+        retrieval_implementation = "orbit-retrieval pipeline (workspace)",
+        scope = ?scope.projects,
+        "deterministic retrieval starting"
+    );
     let mut sources = Vec::new();
     let mut records = Vec::new();
     let mut next_call_id = 0u32;
+
+    events.emit(EventPayload::RetrievalStarted {
+        scope: scope.projects.clone(),
+    });
 
     if scope.projects.is_empty() {
         call(
@@ -270,6 +264,7 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
         call(
@@ -282,9 +277,21 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
-        return (scope, sources, records);
+        events.emit(EventPayload::RetrievalCompleted {
+            scope: scope.projects.clone(),
+            action_count: records.len(),
+            source_count: sources.len(),
+        });
+        return RetrievalOutcome {
+            scope,
+            sources,
+            records,
+            terms: Vec::new(),
+            declared_symbols: HashSet::new(),
+        };
     }
 
     let bounded_scope: Vec<String> = scope
@@ -305,44 +312,162 @@ pub async fn run(
             &mut sources,
             &mut records,
             &mut next_call_id,
+            events,
         )
         .await;
     }
 
-    let query = extract_search_query(question, &bounded_scope, project_registry);
-    if let Some(query) = query {
-        call(
-            registry,
-            action_ctx,
-            confirmation,
-            history,
-            "workspace.search",
-            json!({ "projects": bounded_scope, "query": query }),
-            &mut sources,
-            &mut records,
-            &mut next_call_id,
-        )
-        .await;
-    } else {
+    // Project names are dropped from the query: they match nearly every
+    // file inside their own project and would drown out the real subject.
+    let analysis = analyze_question(question, &bounded_scope, project_registry, context_terms);
+    let terms = analysis.all_terms();
+    let mut any_evidence = false;
+    let mut declared_symbols: HashSet<String> = HashSet::new();
+
+    // The same evidence planner the single-project path uses. This
+    // module previously ran `workspace.search` and read whatever it
+    // ranked highest, which is why `orbit chat` in workspace mode kept
+    // answering a question about `SessionRuntime` out of
+    // `tests/grounding.rs` while every unit test of the new pipeline
+    // passed: the pipeline was never on this path at all.
+    //
+    // The planner decides; this function only translates its decisions
+    // into `workspace.*` action calls, so the two front ends cannot
+    // drift apart again.
+    if !terms.is_empty() {
         for project in &bounded_scope {
-            for path in overview_candidates(registry, action_ctx, confirmation, project).await {
+            let Some(agenda) = plan_project_evidence(
+                project_registry,
+                project,
+                question,
+                context_terms,
+                &bounded_scope,
+            ) else {
+                continue;
+            };
+            if agenda.is_empty() {
+                continue;
+            }
+            any_evidence = true;
+            declared_symbols.extend(agenda.declared_symbols.iter().cloned());
+            orbit_retrieval::agenda::trace(&agenda, "orbit-retrieval pipeline", Some(project));
+            if let Some(report) = &agenda.diagnostics {
+                tracing::debug!(project = %project, "evidence selection:\n{report}");
+            }
+
+            // Whole files first, then the exact declaration spans: a
+            // model answers from what is nearest its question.
+            for read in &agenda.reads {
                 call(
                     registry,
                     action_ctx,
                     confirmation,
                     history,
                     "workspace.read_file",
-                    json!({ "project": project, "path": path, "max_bytes": OVERVIEW_READ_BYTES }),
+                    json!({
+                        "project": project,
+                        "path": read.path.to_string_lossy(),
+                        "max_bytes": OVERVIEW_READ_BYTES,
+                        "truncate": true,
+                    }),
                     &mut sources,
                     &mut records,
                     &mut next_call_id,
+                    events,
+                )
+                .await;
+            }
+
+            for span in &agenda.symbol_spans {
+                call(
+                    registry,
+                    action_ctx,
+                    confirmation,
+                    history,
+                    "workspace.read_file",
+                    json!({
+                        "project": project,
+                        "path": span.path.to_string_lossy(),
+                        "line_start": span.line_start,
+                        "line_end": span.line_end,
+                        "max_bytes": OVERVIEW_READ_BYTES,
+                        "truncate": true,
+                    }),
+                    &mut sources,
+                    &mut records,
+                    &mut next_call_id,
+                    events,
+                )
+                .await;
+            }
+
+            if let Some(anchor) = agenda.anchor {
+                history.push(Message::system(anchor));
+            }
+        }
+    }
+
+    // Nothing matched: fall back to whatever reads like an overview,
+    // which is what answers "what does this project do".
+    if !any_evidence {
+        for project in &bounded_scope {
+            for path in
+                overview_candidates(registry, action_ctx, confirmation, project, events).await
+            {
+                call(
+                    registry,
+                    action_ctx,
+                    confirmation,
+                    history,
+                    "workspace.read_file",
+                    json!({ "project": project, "path": path, "max_bytes": OVERVIEW_READ_BYTES, "truncate": true }),
+                    &mut sources,
+                    &mut records,
+                    &mut next_call_id,
+                    events,
                 )
                 .await;
             }
         }
     }
 
-    (scope, sources, records)
+    events.emit(EventPayload::RetrievalCompleted {
+        scope: scope.projects.clone(),
+        action_count: records.len(),
+        source_count: sources.len(),
+    });
+
+    RetrievalOutcome {
+        scope,
+        sources,
+        records,
+        terms,
+        declared_symbols,
+    }
+}
+
+/// Analyze `question` into search terms, excluding the names and aliases
+/// of the projects already being searched.
+fn analyze_question(
+    question: &str,
+    scope_names: &[String],
+    registry: &ProjectRegistry,
+    context_terms: &[String],
+) -> orbit_project::AnalyzedQuery {
+    let mut excluded: HashSet<String> = HashSet::new();
+    for name in scope_names {
+        if let Ok(entry) = registry.resolve_project(name) {
+            excluded.extend(orbit_project::content_terms(&entry.name));
+            for alias in &entry.aliases {
+                excluded.extend(orbit_project::content_terms(alias));
+            }
+        }
+    }
+
+    let mut analysis = orbit_project::analyze_with_context(question, context_terms);
+    analysis.terms.retain(|t| !excluded.contains(t));
+    analysis.context_terms.retain(|t| !excluded.contains(t));
+    analysis
 }
 
 async fn overview_candidates(
@@ -350,13 +475,16 @@ async fn overview_candidates(
     action_ctx: &ActionContext,
     confirmation: &dyn ConfirmationProvider,
     project: &str,
+    events: &EventEmitter,
 ) -> Vec<String> {
     let (_, result) = registry
-        .execute(
+        .execute_observed(
             action_ctx,
             "workspace.list_project_files",
             orbit_core::ActionInput(json!({ "project": project })),
             confirmation,
+            events,
+            &events.next_execution_id(),
         )
         .await;
     let Ok(output) = result else {
@@ -390,13 +518,16 @@ async fn call(
     sources: &mut Vec<SourceReference>,
     records: &mut Vec<ExecutionRecord>,
     next_call_id: &mut u32,
-) {
+    events: &EventEmitter,
+) -> Option<Value> {
     let (record, result) = registry
-        .execute(
+        .execute_observed(
             action_ctx,
             name,
             orbit_core::ActionInput(arguments.clone()),
             confirmation,
+            events,
+            &events.next_execution_id(),
         )
         .await;
     records.push(record);
@@ -417,9 +548,11 @@ async fn call(
                 total_sources = sources.len(),
                 "workspace retrieval step executed"
             );
+            Some(output.data)
         }
         Err(err) => {
             tracing::debug!(action = name, error = %err, "workspace retrieval step skipped");
+            None
         }
     }
 }
@@ -498,24 +631,49 @@ mod tests {
         assert_eq!(scope.projects, vec!["mission-tools".to_string()]);
     }
 
+    /// A project already being searched must not also be a search term:
+    /// its own name matches nearly every file inside it and would drown
+    /// out the actual subject.
     #[test]
-    fn extract_search_query_strips_project_names_and_stopwords() {
+    fn the_query_excludes_the_names_of_the_projects_being_searched() {
         let registry = registry_with(workspace_yaml());
         let scope = vec!["docs".to_string(), "obc".to_string()];
-        let query = extract_search_query(
+        let analysis = analyze_question(
             "Compare docs and OBC regarding STM32 selection",
             &scope,
             &registry,
+            &[],
         );
-        assert_eq!(query.as_deref(), Some("STM32 selection"));
+        let terms = analysis.all_terms();
+        assert!(terms.contains(&"stm32".to_string()), "{terms:?}");
+        assert!(!terms.contains(&"docs".to_string()), "{terms:?}");
+        assert!(!terms.contains(&"obc".to_string()), "{terms:?}");
     }
 
+    /// A pure overview question has no subject of its own, so there is
+    /// nothing to search for and retrieval falls back to overview reads.
     #[test]
-    fn extract_search_query_is_none_for_a_pure_overview_question() {
+    fn a_pure_overview_question_yields_no_search_terms() {
         let registry = registry_with(workspace_yaml());
         let scope = vec!["obc".to_string()];
-        let query = extract_search_query("What does the OBC project do?", &scope, &registry);
-        assert_eq!(query, None);
+        let analysis = analyze_question("What does the OBC project do?", &scope, &registry, &[]);
+        assert!(analysis.all_terms().is_empty(), "{analysis:?}");
+    }
+
+    /// A thin follow-up must inherit the previous turn's subject.
+    #[test]
+    fn a_follow_up_inherits_context_terms() {
+        let registry = registry_with(workspace_yaml());
+        let scope = vec!["obc".to_string()];
+        let analysis = analyze_question(
+            "Now explain how cancellation works.",
+            &scope,
+            &registry,
+            &["session".to_string(), "runtime".to_string()],
+        );
+        let terms = analysis.all_terms();
+        assert!(terms.contains(&"cancel".to_string()), "{terms:?}");
+        assert!(terms.contains(&"session".to_string()), "{terms:?}");
     }
 
     async fn built_registry_with_content() -> (tempfile::TempDir, ProjectRegistry) {
@@ -562,7 +720,7 @@ mod tests {
         let action_ctx = project_registry.workspace_action_context();
 
         let mut history = Vec::new();
-        let (scope, sources, _records) = run(
+        let retrieved = run(
             &action_registry,
             &action_ctx,
             &project_registry,
@@ -570,8 +728,12 @@ mod tests {
             "What does the OBC project do?",
             None,
             &mut history,
+            &orbit_core::EventEmitter::null(),
+            &[],
         )
         .await;
+        #[allow(unused_variables)]
+        let (scope, sources, records) = (retrieved.scope, retrieved.sources, retrieved.records);
 
         assert_eq!(scope.projects, vec!["obc".to_string()]);
         assert!(!sources.is_empty());
@@ -600,7 +762,7 @@ mod tests {
         let action_ctx = project_registry.workspace_action_context();
 
         let mut history = Vec::new();
-        let (scope, sources, _records) = run(
+        let retrieved = run(
             &action_registry,
             &action_ctx,
             &project_registry,
@@ -608,8 +770,12 @@ mod tests {
             "Compare docs and OBC regarding STM32 selection",
             None,
             &mut history,
+            &orbit_core::EventEmitter::null(),
+            &[],
         )
         .await;
+        #[allow(unused_variables)]
+        let (scope, sources, records) = (retrieved.scope, retrieved.sources, retrieved.records);
 
         assert_eq!(scope.projects, vec!["docs".to_string(), "obc".to_string()]);
         let projects_in_sources: HashSet<_> = sources
@@ -638,7 +804,7 @@ mod tests {
         let action_ctx = project_registry.workspace_action_context();
 
         let mut history = Vec::new();
-        let (scope, _sources, records) = run(
+        let retrieved = run(
             &action_registry,
             &action_ctx,
             &project_registry,
@@ -646,8 +812,12 @@ mod tests {
             "What projects are available?",
             None,
             &mut history,
+            &orbit_core::EventEmitter::null(),
+            &[],
         )
         .await;
+        #[allow(unused_variables)]
+        let (scope, sources, records) = (retrieved.scope, retrieved.sources, retrieved.records);
 
         assert!(scope.projects.is_empty());
         assert!(

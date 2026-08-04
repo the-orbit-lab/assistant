@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 
 pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 pub const DEFAULT_OLLAMA_ENDPOINT: &str = "http://localhost:11434";
+
+/// `project.type` of the synthetic context that represents a *workspace*
+/// rather than a project (see
+/// `orbit_workspace::ProjectRegistry::workspace_action_context`).
+///
+/// A workspace is not a project: code that reports "which project is this"
+/// must not report the workspace's name as one. Named here so the producer
+/// and the consumers of that marker stay in sync.
+pub const WORKSPACE_PROJECT_TYPE: &str = "workspace";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen2.5:latest";
 
 /// Exclude patterns applied regardless of what the project configures.
@@ -112,6 +121,16 @@ fn default_include() -> Vec<String> {
         "docs/**".to_string(),
         "src/**".to_string(),
         "tests/**".to_string(),
+        // A Cargo workspace keeps its code in `crates/<name>/src/**`, not
+        // in a top-level `src/`. Without these, a workspace project's
+        // entire implementation is invisible to search and to grounded
+        // answers -- the repository looks like documentation only, and a
+        // question about a type defined in code can never be answered
+        // from the code that defines it.
+        "crates/**".to_string(),
+        // The same shape under other common monorepo roots.
+        "packages/**".to_string(),
+        "libs/**".to_string(),
     ]
 }
 
@@ -284,6 +303,10 @@ context:
     - docs/**
     - src/**
     - tests/**
+    # A Cargo workspace keeps its code in crates/<name>/src/**, not in a
+    # top-level src/. Without this, a workspace project's implementation
+    # is invisible to search and to grounded answers.
+    - crates/**
 
   # Exclude always wins over include. A mandatory set (.git, .orbit, secrets,
   # *.key, *.pem, .env*, target, node_modules) is enforced in addition to

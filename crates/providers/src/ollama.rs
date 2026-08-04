@@ -5,7 +5,7 @@ use orbit_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::provider::ModelProvider;
+use crate::provider::{DeltaHandler, ModelProvider};
 
 /// The default local Ollama endpoint. No API key is required or supported.
 pub const DEFAULT_ENDPOINT: &str = "http://localhost:11434";
@@ -40,10 +40,10 @@ impl OllamaProvider {
         let response = self
             .client
             .get(&url)
-            .timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(AVAILABILITY_TIMEOUT_SECS))
             .send()
             .await
-            .map_err(|e| connection_error(&self.endpoint, &e))?;
+            .map_err(|e| connection_error(&self.endpoint, &e, AVAILABILITY_TIMEOUT_SECS))?;
 
         if !response.status().is_success() {
             return Err(ProviderError::Other {
@@ -80,14 +80,26 @@ impl OllamaProvider {
 }
 
 /// `qwen2.5` should match an installed `qwen2.5:latest`, and vice versa.
+/// How long the availability probe (`GET /api/tags`) may take. Short on
+/// purpose: it answers "is the server there", not "can it think".
+const AVAILABILITY_TIMEOUT_SECS: u64 = 5;
+
 fn tag_matches(installed: &str, requested: &str) -> bool {
     let strip = |s: &str| s.split(':').next().unwrap_or(s).to_string();
     strip(installed) == strip(requested)
 }
 
-fn connection_error(endpoint: &str, err: &reqwest::Error) -> ProviderError {
+/// Map a transport failure onto a [`ProviderError`].
+///
+/// `timeout_secs` must be the deadline that actually applied to this
+/// request: the availability check uses its own short one, while a chat
+/// uses `ModelRequest::timeout`. Reporting a fixed number here told users
+/// a chat had given up after 5 seconds when it had in fact waited 30,
+/// which is the difference between "the server is down" and "the model
+/// is too slow for this much context".
+fn connection_error(endpoint: &str, err: &reqwest::Error, timeout_secs: u64) -> ProviderError {
     if err.is_timeout() {
-        ProviderError::Timeout { timeout_secs: 5 }
+        ProviderError::Timeout { timeout_secs }
     } else {
         ProviderError::ConnectionFailed {
             endpoint: endpoint.to_string(),
@@ -96,18 +108,21 @@ fn connection_error(endpoint: &str, err: &reqwest::Error) -> ProviderError {
     }
 }
 
-#[async_trait::async_trait]
-impl ModelProvider for OllamaProvider {
-    fn describe(&self) -> String {
-        format!("ollama ({} @ {})", self.model, self.endpoint)
-    }
-
-    async fn chat(&self, request: &ModelRequest) -> Result<ModelResponse, OrbitError> {
+impl OllamaProvider {
+    /// POST `/api/chat`, mapping transport and HTTP failures onto
+    /// [`ProviderError`]. Shared by the buffered and streaming paths so
+    /// both report an unreachable server, a missing model, or a rate limit
+    /// identically.
+    async fn post_chat(
+        &self,
+        request: &ModelRequest,
+        stream: bool,
+    ) -> Result<reqwest::Response, OrbitError> {
         let wire = ChatRequest {
             model: request.model.clone(),
             messages: request.messages.iter().map(to_wire_message).collect(),
             tools: request.tools.iter().map(to_wire_tool).collect(),
-            stream: false,
+            stream,
         };
 
         let url = format!("{}/api/chat", self.endpoint.trim_end_matches('/'));
@@ -118,7 +133,7 @@ impl ModelProvider for OllamaProvider {
             .json(&wire)
             .send()
             .await
-            .map_err(|e| connection_error(&self.endpoint, &e))?;
+            .map_err(|e| connection_error(&self.endpoint, &e, request.timeout.as_secs()))?;
 
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -151,14 +166,148 @@ impl ModelProvider for OllamaProvider {
             }));
         }
 
+        Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for OllamaProvider {
+    fn describe(&self) -> String {
+        format!("ollama ({} @ {})", self.model, self.endpoint)
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn chat(&self, request: &ModelRequest) -> Result<ModelResponse, OrbitError> {
+        let response = self.post_chat(request, false).await?;
         let body: ChatResponse = response.json().await.map_err(|e| {
             OrbitError::Provider(ProviderError::InvalidResponse {
                 reason: e.to_string(),
             })
         })?;
-
         from_wire_response(body)
     }
+
+    /// Ollama streams `/api/chat` as newline-delimited JSON: one object per
+    /// chunk, each carrying an incremental `message.content`, with a final
+    /// object marked `done`.
+    ///
+    /// Content is accumulated exactly as it is handed to `handler`, so the
+    /// returned message's content is always the concatenation of the
+    /// emitted deltas. Tool calls are collected from whichever chunk
+    /// carries them, so tool calling behaves the same as the buffered path.
+    async fn chat_streaming(
+        &self,
+        request: &ModelRequest,
+        handler: &dyn DeltaHandler,
+    ) -> Result<ModelResponse, OrbitError> {
+        let mut response = self.post_chat(request, true).await?;
+
+        // Bytes, not a String: a multi-byte UTF-8 character can straddle
+        // two HTTP chunks, and converting each chunk independently would
+        // corrupt it. Only complete lines are decoded.
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut content = String::new();
+        let mut tool_calls: Vec<WireResponseToolCall> = Vec::new();
+        let mut done_reason: Option<String> = None;
+        let mut stopped_early = false;
+
+        'read: while let Some(chunk) = response.chunk().await.map_err(|e| {
+            OrbitError::Provider(ProviderError::InvalidResponse {
+                reason: format!("failed while reading the response stream: {e}"),
+            })
+        })? {
+            buffer.extend_from_slice(&chunk);
+
+            while let Some(newline) = buffer.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=newline).collect();
+                if !consume_stream_line(
+                    &line,
+                    handler,
+                    &mut content,
+                    &mut tool_calls,
+                    &mut done_reason,
+                )? {
+                    stopped_early = true;
+                    break 'read;
+                }
+            }
+        }
+
+        // A final chunk may arrive without a trailing newline.
+        if !stopped_early && !buffer.is_empty() {
+            let line = std::mem::take(&mut buffer);
+            consume_stream_line(
+                &line,
+                handler,
+                &mut content,
+                &mut tool_calls,
+                &mut done_reason,
+            )?;
+        }
+
+        from_wire_response(ChatResponse {
+            message: WireResponseMessage {
+                content: Some(content),
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
+                },
+            },
+            done_reason,
+        })
+    }
+}
+
+/// Parse and apply one NDJSON line from a streamed response. Returns
+/// `false` when `handler` asked to stop consuming the stream.
+///
+/// A blank line is skipped, and a line that is not valid JSON is a
+/// protocol error rather than something to silently ignore — silently
+/// dropping it would turn a malformed stream into a plausible-looking
+/// short answer.
+fn consume_stream_line(
+    line: &[u8],
+    handler: &dyn DeltaHandler,
+    content: &mut String,
+    tool_calls: &mut Vec<WireResponseToolCall>,
+    done_reason: &mut Option<String>,
+) -> Result<bool, OrbitError> {
+    let text = std::str::from_utf8(line)
+        .map_err(|e| {
+            OrbitError::Provider(ProviderError::InvalidResponse {
+                reason: format!("response stream was not valid UTF-8: {e}"),
+            })
+        })?
+        .trim();
+    if text.is_empty() {
+        return Ok(true);
+    }
+
+    let chunk: StreamChunk = serde_json::from_str(text).map_err(|e| {
+        OrbitError::Provider(ProviderError::InvalidResponse {
+            reason: format!("malformed streaming chunk: {e}"),
+        })
+    })?;
+
+    if let Some(reason) = chunk.done_reason {
+        *done_reason = Some(reason);
+    }
+    if let Some(message) = chunk.message {
+        if let Some(calls) = message.tool_calls {
+            tool_calls.extend(calls);
+        }
+        if let Some(delta) = message.content.filter(|d| !d.is_empty()) {
+            content.push_str(&delta);
+            if !handler.on_delta(&delta) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn to_wire_message(message: &Message) -> WireMessage {
@@ -289,6 +438,16 @@ struct ChatResponse {
     done_reason: Option<String>,
 }
 
+/// One newline-delimited object from a streamed `/api/chat` response.
+/// `message` is absent on some keep-alive/final frames, so it is optional.
+#[derive(Debug, Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    message: Option<WireResponseMessage>,
+    #[serde(default)]
+    done_reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WireResponseMessage {
     #[serde(default)]
@@ -394,5 +553,125 @@ mod tests {
         let parsed = from_wire_response(response).unwrap();
         assert_eq!(parsed.finish_reason, FinishReason::Stop);
         assert_eq!(parsed.message.content, "hello");
+    }
+}
+
+/// Exercises the real NDJSON line parser used by `chat_streaming`, without
+/// needing a live Ollama server: the same function that consumes bytes off
+/// the socket consumes these lines.
+#[cfg(test)]
+mod streaming_wire_tests {
+    use super::*;
+    use crate::provider::IgnoreDeltas;
+    use std::sync::Mutex;
+
+    struct Collector(Mutex<Vec<String>>);
+
+    impl DeltaHandler for Collector {
+        fn on_delta(&self, text: &str) -> bool {
+            self.0.lock().unwrap().push(text.to_string());
+            true
+        }
+    }
+
+    fn feed(lines: &[&str], handler: &dyn DeltaHandler) -> (String, Vec<WireResponseToolCall>) {
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut done = None;
+        for line in lines {
+            consume_stream_line(
+                line.as_bytes(),
+                handler,
+                &mut content,
+                &mut calls,
+                &mut done,
+            )
+            .expect("line should parse");
+        }
+        (content, calls)
+    }
+
+    #[test]
+    fn incremental_content_chunks_accumulate_in_order() {
+        let collector = Collector(Mutex::new(Vec::new()));
+        let (content, _) = feed(
+            &[
+                r#"{"message":{"content":"The "},"done":false}"#,
+                r#"{"message":{"content":"watchdog "},"done":false}"#,
+                r#"{"message":{"content":"resets."},"done":false}"#,
+                r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+            ],
+            &collector,
+        );
+
+        assert_eq!(content, "The watchdog resets.");
+        assert_eq!(
+            collector.0.lock().unwrap().concat(),
+            content,
+            "emitted deltas must reconstruct the accumulated content exactly"
+        );
+    }
+
+    #[test]
+    fn tool_calls_are_collected_from_whichever_chunk_carries_them() {
+        let (_, calls) = feed(
+            &[
+                r#"{"message":{"content":""},"done":false}"#,
+                r#"{"message":{"tool_calls":[{"function":{"name":"project.search","arguments":{"query":"brownout"}}}]},"done":false}"#,
+                r#"{"done":true,"done_reason":"stop"}"#,
+            ],
+            &IgnoreDeltas,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "project.search");
+    }
+
+    #[test]
+    fn blank_lines_are_skipped() {
+        let (content, _) = feed(
+            &["", "   ", r#"{"message":{"content":"ok"},"done":true}"#],
+            &IgnoreDeltas,
+        );
+        assert_eq!(content, "ok");
+    }
+
+    /// A corrupt frame must surface as a provider error, not be silently
+    /// dropped -- dropping it would turn a broken stream into a
+    /// plausible-looking short answer.
+    #[test]
+    fn a_malformed_chunk_is_a_provider_error() {
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut done = None;
+        let err = consume_stream_line(
+            b"{not json}",
+            &IgnoreDeltas,
+            &mut content,
+            &mut calls,
+            &mut done,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            OrbitError::Provider(ProviderError::InvalidResponse { .. })
+        ));
+    }
+
+    #[test]
+    fn a_handler_that_stops_reports_false() {
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut done = None;
+        let keep_going = consume_stream_line(
+            br#"{"message":{"content":"partial"},"done":false}"#,
+            &|_: &str| false,
+            &mut content,
+            &mut calls,
+            &mut done,
+        )
+        .unwrap();
+        assert!(!keep_going);
+        assert_eq!(content, "partial");
     }
 }

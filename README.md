@@ -166,9 +166,10 @@ cd apps/desktop && pnpm install
 pnpm tauri dev                  # then choose a workspace and Connect
 ```
 
-Voice input and spoken responses are **not** built yet, and there is no
-wake word — see [docs/VOICE.md](docs/VOICE.md) for the intended design
-and [docs/DESKTOP_APP.md](docs/DESKTOP_APP.md) for the architecture.
+Answers render as Markdown and are spoken through the macOS
+synthesizer. Voice *input* is not built and there is no wake word — see
+[docs/VOICE.md](docs/VOICE.md) and
+[docs/DESKTOP_APP.md](docs/DESKTOP_APP.md).
 
 ## MCP
 
@@ -221,9 +222,9 @@ details in [docs/SECURITY.md](docs/SECURITY.md).
   see [docs/WORKSPACES.md](docs/WORKSPACES.md#known-limitations).
 - Sessions are in-memory only; there is no persistent conversation
   memory, and a session runs one turn at a time.
-- The desktop app covers text chat, activity, sources, permissions, and
-  cancellation; voice input and spoken responses are not built, and
-  answers render as plain text rather than Markdown.
+- The desktop app covers text chat with Markdown, activity, sources,
+  permissions, cancellation, and spoken answers on macOS. Voice *input*
+  is not built: no speech-to-text provider is configured.
 
 ## Development
 

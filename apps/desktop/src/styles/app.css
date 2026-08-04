@@ -3,6 +3,13 @@
    node while a turn runs, timeline dots that resolve — not decoration. */
 
 :root {
+  /* macOS draws the traffic lights over the content with an overlay
+     title bar. These are the insets that keep anything from sliding
+     under them, and the outer breathing room the window needs so the
+     composer is not flush against the bottom edge. */
+  --titlebar-h: 30px;
+  --traffic-lights-w: 76px;
+  --edge: 20px;
   --bg: #0b0d10;
   --surface: #12151a;
   --surface-2: #171b21;
@@ -37,9 +44,15 @@ button.link { background: none; border: none; color: var(--muted); font-size: 12
 /* Header ---------------------------------------------------------- */
 .bar {
   display: flex; align-items: center; gap: 16px;
-  padding: 10px 16px; border-bottom: 1px solid var(--line);
+  /* Left padding clears the traffic lights; top padding clears the
+     title bar, which the window draws over this element. */
+  padding: calc(var(--titlebar-h) - 8px) var(--edge) 10px var(--traffic-lights-w);
+  border-bottom: 1px solid var(--line);
   background: rgba(18, 21, 26, .72); backdrop-filter: blur(12px);
+  /* The header is the window's drag handle. */
+  -webkit-app-region: drag;
 }
+.bar button, .bar .chip { -webkit-app-region: no-drag; }
 .brand { display: flex; align-items: center; gap: 9px; letter-spacing: .02em; }
 /* The orbital node: a ring that only moves while a turn is running. */
 .node {
@@ -76,7 +89,7 @@ button.link { background: none; border: none; color: var(--muted); font-size: 12
 /* Columns --------------------------------------------------------- */
 .columns { display: grid; grid-template-columns: 1fr 330px; flex: 1; min-height: 0; }
 .conversation { display: flex; flex-direction: column; min-height: 0; }
-.transcript { flex: 1; overflow-y: auto; padding: 20px 24px; }
+.transcript { flex: 1; overflow-y: auto; padding: 24px var(--edge) 8px calc(var(--edge) + 8px); }
 .empty { color: var(--muted); font-size: 13px; }
 
 .turn { margin-bottom: 18px; max-width: 74ch; }
@@ -98,20 +111,74 @@ button.link { background: none; border: none; color: var(--muted); font-size: 12
 @keyframes blink { 50% { opacity: 0; } }
 
 /* Composer -------------------------------------------------------- */
-.composer { border-top: 1px solid var(--line); padding: 12px 24px 16px; background: var(--surface); }
+.composer {
+  border-top: 1px solid var(--line);
+  /* The bottom inset is the fix for the composer sitting on the window
+     edge: a window has no chrome below it to provide that margin. */
+  padding: 14px var(--edge) calc(var(--edge) + 2px) calc(var(--edge) + 8px);
+  background: var(--surface);
+}
 .composer textarea {
   width: 100%; resize: none; background: var(--surface-2); color: var(--text);
   border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px;
   font: inherit; line-height: 1.5;
 }
 .composer textarea:focus { outline: none; border-color: #2c4f4a; }
-.composer-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 9px; }
+.composer-actions {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-top: 11px;
+}
+.send-actions { display: flex; gap: 8px; }
+
+/* Voice ----------------------------------------------------------- */
+.voice { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mic {
+  position: relative; width: 34px; height: 34px; padding: 0;
+  border-radius: 50%; display: grid; place-items: center; flex-shrink: 0;
+}
+.mic-glyph {
+  width: 10px; height: 15px; border-radius: 5px;
+  border: 1.5px solid currentColor; position: relative; color: var(--muted);
+}
+.mic-glyph::after {
+  content: ""; position: absolute; left: 50%; bottom: -6px;
+  width: 9px; height: 5px; border: 1.5px solid currentColor;
+  border-top: none; border-radius: 0 0 9px 9px; transform: translateX(-50%);
+}
+/* Capturing is the only state that colours the microphone. It is
+   driven by `isCapturing`, so it cannot show active while silent. */
+.mic.capturing { border-color: var(--accent); background: #10231f; }
+.mic.capturing .mic-glyph { color: var(--accent); }
+.wave {
+  position: absolute; inset: -5px; border-radius: 50%;
+  border: 1.5px solid var(--accent); opacity: .5;
+  animation: listen 1.3s ease-out infinite;
+}
+@keyframes listen {
+  0% { transform: scale(.85); opacity: .55; }
+  100% { transform: scale(1.35); opacity: 0; }
+}
+.voice-state { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.voice-state.state-listening, .voice-state.state-speaking { color: var(--accent); }
+.voice-state.state-error { color: var(--danger); }
+.stop-voice { text-decoration: underline; }
+.voice-note {
+  margin: 9px 0 0; font-size: 12px; color: var(--warn);
+  background: #1d1809; border: 1px solid #3a3117; border-radius: 7px;
+  padding: 8px 10px; cursor: pointer; line-height: 1.5;
+}
 
 /* Inspector ------------------------------------------------------- */
 .inspector {
   border-left: 1px solid var(--line); background: var(--surface);
-  overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 14px;
+  overflow-y: auto;
+  padding: 20px 18px calc(var(--edge) + 2px);
+  display: flex; flex-direction: column; gap: 22px;
 }
+/* Each panel is a block with its own breathing room, so the timeline
+   and the source list do not read as one undifferentiated column. */
+.panel { display: flex; flex-direction: column; }
+.panel + .panel { border-top: 1px solid var(--line); padding-top: 18px; }
 .panel h2 {
   font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
   color: var(--muted); margin: 0 0 9px; display: flex;
@@ -139,9 +206,12 @@ button.link { background: none; border: none; color: var(--muted); font-size: 12
 .timeline .ms { margin-left: auto; color: var(--muted); font-size: 11px; }
 
 .sources { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
-.sources li {
-  padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px;
-  margin-bottom: 6px; background: var(--surface-2); word-break: break-all;
+.sources li { margin-bottom: 7px; }
+.sources .source {
+  display: block; width: 100%; text-align: left;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface-2); word-break: break-all; font-size: 12.5px;
+  line-height: 1.5;
 }
 .sources .proj { color: var(--accent); margin-right: 6px; }
 .sources .path { font-family: ui-monospace, monospace; }
@@ -180,3 +250,67 @@ button.link { background: none; border: none; color: var(--muted); font-size: 12
 .sheet dd.subtle { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11.5px; }
 .sheet code { font-family: ui-monospace, monospace; font-size: 12px; }
 .sheet-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+
+/* Markdown -------------------------------------------------------- */
+/* Tight vertical rhythm: an answer is prose in a panel, not a page, so
+   headings are only slightly larger than body text and the spacing is
+   compact enough that a four-heading answer still reads as one thing. */
+.markdown > *:first-child { margin-top: 0; }
+.markdown > *:last-child { margin-bottom: 0; }
+.markdown p { margin: 0 0 .8em; line-height: 1.62; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+  margin: 1.35em 0 .5em; font-weight: 600; line-height: 1.3;
+}
+.markdown h1 { font-size: 1.2em; }
+.markdown h2 { font-size: 1.1em; }
+.markdown h3 { font-size: 1em; color: var(--accent); }
+.markdown h4 { font-size: .95em; color: var(--muted); }
+.markdown ul, .markdown ol { margin: 0 0 .8em; padding-left: 1.35em; }
+.markdown li { margin-bottom: .3em; line-height: 1.6; }
+.markdown li::marker { color: var(--muted); }
+.markdown blockquote {
+  margin: 0 0 .8em; padding: .1em 0 .1em .9em;
+  border-left: 2px solid var(--line); color: var(--muted);
+}
+.markdown hr { border: none; border-top: 1px solid var(--line); margin: 1.3em 0; }
+.markdown a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+/* A non-http scheme is shown as plain text rather than made clickable. */
+.markdown .link-blocked { color: var(--muted); text-decoration: underline dotted; }
+.markdown strong { font-weight: 650; color: #f2f5f9; }
+.markdown em { font-style: italic; color: #d6dbe4; }
+
+.inline-code {
+  font-family: ui-monospace, "SF Mono", monospace; font-size: .88em;
+  background: #1c2128; border: 1px solid var(--line);
+  border-radius: 4px; padding: .1em .34em; color: #cdd6e2;
+}
+
+.markdown table {
+  width: 100%; border-collapse: collapse; margin: 0 0 .9em;
+  font-size: .92em; display: block; overflow-x: auto;
+}
+.markdown th, .markdown td {
+  border: 1px solid var(--line); padding: 6px 9px; text-align: left;
+}
+.markdown th { background: var(--surface-2); font-weight: 600; }
+
+.code-block {
+  margin: 0 0 .9em; border: 1px solid var(--line);
+  border-radius: 8px; overflow: hidden; background: #0e1116;
+}
+.code-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 5px 9px; background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+}
+.code-head .lang {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted);
+}
+.code-head .copy { padding: 2px 8px; font-size: 11px; }
+.code-block pre { margin: 0; padding: 10px 12px; overflow-x: auto; }
+.code-block code {
+  font-family: ui-monospace, "SF Mono", monospace;
+  font-size: 12.2px; line-height: 1.55; color: #cdd6e2;
+}

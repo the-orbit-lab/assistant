@@ -16,10 +16,16 @@ rendering, a live activity timeline grouped by `execution_id`,
 deduplicated sources, the permission sheet, and cancellation that keeps
 the session alive.
 
-**Not built yet:** voice input and spoken responses. The composer has no
-microphone button because there is no speech provider behind it; adding
-one that did nothing would be worse than its absence. See
-[`docs/VOICE.md`](../../docs/VOICE.md) for the intended shape.
+Assistant answers render as Markdown — headings, lists, tables,
+blockquotes, links, and fenced code blocks with copy. Raw HTML is never
+rendered.
+
+Orbit **speaks** its answers through the macOS synthesizer, buffered into
+sentences so speech starts while text is still streaming.
+
+**Not built yet:** voice *input*. The microphone button is present and
+explains that no speech-to-text provider is configured, rather than
+pretending or hiding. See [`docs/VOICE.md`](../../docs/VOICE.md).
 
 ## Running it
 
@@ -57,6 +63,8 @@ cleanly when no release build exists.
 
 ```text
 src/
+├── components/          MarkdownMessage, CodeBlock, SourceCitation
+├── features/voice/      providers, sentence buffering, voice states
 ├── protocol/frames.ts   wire types, kept in sync with APP_PROTOCOL.md
 ├── state/session.ts     the reducer: frames in, conversation out
 ├── services/orbit.ts    the only path to the backend (Tauri invoke)
@@ -64,6 +72,7 @@ src/
 └── App.tsx              two-column shell
 src-tauri/
 ├── src/sidecar.rs       process manager: spawn, handshake, frame routing
+├── src/speech.rs        macOS synthesizer, fixed argument list
 └── src/lib.rs           the four commands the webview may call
 ```
 

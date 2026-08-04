@@ -6,10 +6,13 @@
 //! directory the user picked in a native dialog.
 
 mod sidecar;
+mod speech;
 
 use std::path::PathBuf;
 
 use sidecar::{Sidecar, SidecarError, SidecarState, StartedBackend};
+use speech::{SpeechError, SpeechState};
+use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 
 /// Every protocol command this app is allowed to send.
@@ -72,6 +75,28 @@ fn backend_running(state: State<'_, Sidecar>) -> bool {
     state.is_running()
 }
 
+/// Speak one utterance. Markup is stripped in Rust so every provider
+/// added later inherits the same rule about what is spoken.
+#[tauri::command]
+fn speak(state: State<'_, Arc<SpeechState>>, text: String) -> Result<(), SpeechError> {
+    state.speak(&text)
+}
+
+#[tauri::command]
+fn stop_speaking(state: State<'_, Arc<SpeechState>>) {
+    state.stop();
+}
+
+#[tauri::command]
+fn speech_available() -> bool {
+    speech::available()
+}
+
+#[tauri::command]
+fn is_speaking(state: State<'_, Arc<SpeechState>>) -> bool {
+    state.speaking()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -79,6 +104,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(Sidecar::new(SidecarState::default()));
+            app.manage(Arc::new(SpeechState::default()));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -94,7 +120,11 @@ pub fn run() {
             start_backend,
             send_command,
             stop_backend,
-            backend_running
+            backend_running,
+            speak,
+            stop_speaking,
+            speech_available,
+            is_speaking
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

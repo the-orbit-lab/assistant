@@ -10,7 +10,12 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { describeError, orbit } from "./services/orbit";
-import { initialState, reduce, sourceKey } from "./state/session";
+import { MarkdownMessage } from "./components/MarkdownMessage";
+import { SourceCitation } from "./components/SourceCitation";
+import { macOsTts, unconfiguredStt } from "./features/voice/providers";
+import { SentenceBuffer } from "./features/voice/sentences";
+import { canStopSpeech, isCapturing, VOICE_LABELS, type VoiceState } from "./features/voice/state";
+import { initialState, reduce, sourceKey, type SourceItem } from "./state/session";
 import type { Frame } from "../src/protocol/frames";
 import "./styles/app.css";
 
@@ -29,7 +34,21 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [showActivity, setShowActivity] = useState(true);
+  const [voice, setVoice] = useState<VoiceState>("idle");
+  const [voiceNote, setVoiceNote] = useState<string>();
+  const [sttReady, setSttReady] = useState(false);
+  const [ttsReady, setTtsReady] = useState(false);
+  const [selectedSource, setSelectedSource] = useState<SourceItem | null>(null);
   const transcript = useRef<HTMLDivElement>(null);
+  // Deltas become whole sentences before they are spoken, so speech
+  // starts early without reading fragments aloud.
+  const speechBuffer = useRef(new SentenceBuffer());
+  const spokenTurn = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    void unconfiguredStt.isAvailable().then(setSttReady);
+    void macOsTts.isAvailable().then(setTtsReady);
+  }, []);
 
   // Frames, diagnostics, and exits arrive on three separate channels so
   // a log line can never be mistaken for protocol.
@@ -47,6 +66,69 @@ export default function App() {
   useEffect(() => {
     transcript.current?.scrollTo({ top: transcript.current.scrollHeight, behavior: "smooth" });
   }, [state.messages]);
+
+  // Speak the assistant's prose as it arrives. Only the newest streaming
+  // message is spoken, and only whole sentences.
+  const latest = state.messages.at(-1);
+  useEffect(() => {
+    if (!ttsReady || !latest || latest.role !== "assistant") return;
+
+    if (spokenTurn.current !== latest.id) {
+      speechBuffer.current.clear();
+      spokenTurn.current = latest.id;
+    }
+    if (latest.status === "streaming") {
+      const already = speechBuffer.current.spokenLength ?? 0;
+      const fresh = latest.text.slice(already);
+      if (!fresh) return;
+      speechBuffer.current.spokenLength = latest.text.length;
+      for (const sentence of speechBuffer.current.push(fresh)) {
+        setVoice("speaking");
+        void macOsTts.speak(sentence).catch(() => setVoice("error"));
+      }
+    } else if (latest.status === "complete") {
+      for (const sentence of speechBuffer.current.flush()) {
+        setVoice("speaking");
+        void macOsTts.speak(sentence).catch(() => setVoice("error"));
+      }
+    }
+  }, [latest?.id, latest?.text, latest?.status, ttsReady]);
+
+  // The indicator must reflect the synthesizer, not our intent.
+  useEffect(() => {
+    if (voice !== "speaking") return;
+    const timer = window.setInterval(() => {
+      void macOsTts.isSpeaking().then((busy) => {
+        if (!busy) setVoice("idle");
+      });
+    }, 400);
+    return () => window.clearInterval(timer);
+  }, [voice]);
+
+  const stopSpeaking = useCallback(() => {
+    speechBuffer.current.clear();
+    void macOsTts.stop();
+    setVoice("stopped");
+    window.setTimeout(() => setVoice("idle"), 900);
+  }, []);
+
+  /** Push-to-talk. No provider is configured, so this explains itself. */
+  const startListening = useCallback(async () => {
+    setVoiceNote(undefined);
+    if (!sttReady) {
+      setVoice("error");
+      setVoiceNote(unconfiguredStt.setupHint);
+      return;
+    }
+    setVoice("requesting_permission");
+    try {
+      await unconfiguredStt.start();
+      setVoice("listening");
+    } catch (error) {
+      setVoice("error");
+      setVoiceNote(error instanceof Error ? error.message : String(error));
+    }
+  }, [sttReady]);
 
   const chooseWorkspace = useCallback(async () => {
     const picked = await open({ directory: true, title: "Select an Orbit workspace" });
@@ -87,6 +169,10 @@ export default function App() {
   /** Cancellation is a protocol message; the session stays alive. */
   const cancel = useCallback(async () => {
     if (!state.sessionId) return;
+    // Cancelling the task silences the answer being read aloud too.
+    speechBuffer.current.clear();
+    void macOsTts.stop();
+    setVoice("idle");
     await orbit.send({ type: "execution.cancel", session_id: state.sessionId }).catch(() => {});
   }, [state.sessionId]);
 
@@ -171,7 +257,11 @@ export default function App() {
                 <article key={message.id} className={`turn ${message.role}`} data-status={message.status}>
                   <div className="who">{message.role === "user" ? "You" : "Orbit"}</div>
                   <div className="body">
-                    {message.text}
+                    {message.role === "assistant" ? (
+                      <MarkdownMessage text={message.text} />
+                    ) : (
+                      message.text
+                    )}
                     {message.status === "streaming" && <span className="caret" />}
                   </div>
                   {message.status === "cancelled" && <div className="note">cancelled</div>}
@@ -195,16 +285,42 @@ export default function App() {
                 rows={3}
               />
               <div className="composer-actions">
-                {state.busy ? (
-                  <button className="danger" onClick={cancel}>
-                    Cancel task
+                <div className="voice">
+                  <button
+                    className={`mic ${isCapturing(voice) ? "capturing" : ""}`}
+                    onPointerDown={startListening}
+                    onPointerUp={() => isCapturing(voice) && setVoice("transcribing")}
+                    title={sttReady ? "Hold to talk" : unconfiguredStt.setupHint}
+                    aria-label="Push to talk"
+                  >
+                    <span className="mic-glyph" />
+                    {isCapturing(voice) && <span className="wave" aria-hidden />}
                   </button>
-                ) : (
+                  <span className={`voice-state state-${voice}`}>
+                    {voice === "idle" && !sttReady ? "Voice output only" : VOICE_LABELS[voice]}
+                  </span>
+                  {canStopSpeech(voice) && (
+                    <button className="link stop-voice" onClick={stopSpeaking}>
+                      Stop voice
+                    </button>
+                  )}
+                </div>
+                <div className="send-actions">
+                  {state.busy && (
+                    <button className="danger" onClick={cancel}>
+                      Cancel task
+                    </button>
+                  )}
                   <button className="primary" onClick={send} disabled={!canSend || !draft.trim()}>
                     Send
                   </button>
-                )}
+                </div>
               </div>
+              {voiceNote && (
+                <p className="voice-note" onClick={() => setVoiceNote(undefined)}>
+                  {voiceNote}
+                </p>
+              )}
             </div>
           </section>
 
@@ -238,19 +354,11 @@ export default function App() {
               {state.sources.length === 0 && <p className="empty">No sources yet.</p>}
               <ul className="sources">
                 {state.sources.map((source) => (
-                  <li key={sourceKey(source)}>
-                    {source.project && <span className="proj">{source.project}</span>}
-                    <span className="path">{source.path}</span>
-                    {source.lineStart !== undefined && (
-                      <span className="lines">
-                        :{source.lineStart}
-                        {source.lineEnd !== undefined && source.lineEnd !== source.lineStart
-                          ? `-${source.lineEnd}`
-                          : ""}
-                      </span>
-                    )}
-                    {source.section && <span className="section">{source.section}</span>}
-                  </li>
+                  <SourceCitation
+                    key={sourceKey(source)}
+                    source={source}
+                    onSelect={setSelectedSource}
+                  />
                 ))}
               </ul>
             </div>
@@ -274,6 +382,47 @@ export default function App() {
             </details>
           </aside>
         </main>
+      )}
+
+      {selectedSource && (
+        <div className="sheet-backdrop" onClick={() => setSelectedSource(null)}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <h2>Source</h2>
+            <dl>
+              {selectedSource.project && (
+                <>
+                  <dt>Project</dt>
+                  <dd>{selectedSource.project}</dd>
+                </>
+              )}
+              <dt>Path</dt>
+              {/* Project-relative, as Orbit reports it: an absolute path
+                  would put a private directory layout on screen. */}
+              <dd><code>{selectedSource.path}</code></dd>
+              {selectedSource.lineStart !== undefined && (
+                <>
+                  <dt>Lines</dt>
+                  <dd>
+                    {selectedSource.lineStart}
+                    {selectedSource.lineEnd !== undefined &&
+                    selectedSource.lineEnd !== selectedSource.lineStart
+                      ? `–${selectedSource.lineEnd}`
+                      : ""}
+                  </dd>
+                </>
+              )}
+              {selectedSource.section && (
+                <>
+                  <dt>Section</dt>
+                  <dd>{selectedSource.section}</dd>
+                </>
+              )}
+            </dl>
+            <div className="sheet-actions">
+              <button onClick={() => setSelectedSource(null)}>Close</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {state.pendingPermission && (

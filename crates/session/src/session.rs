@@ -333,8 +333,21 @@ impl SessionRuntime {
     }
 
     /// Every source this session has collected, in first-seen order.
+    /// Every source this session collected, deduplicated.
+    ///
+    /// A turn contributes sources twice over by design -- deterministic
+    /// retrieval records what it read, and the agent records what its own
+    /// tool calls returned -- and a multi-turn session revisits the same
+    /// files. Without this, `/sources` repeated identical references and
+    /// listed a whole file next to the precise lines of it that were
+    /// actually quoted.
+    ///
+    /// Deduplication is by project, path, line range, and section (the
+    /// project is part of the encoded path for workspace sources), and a
+    /// path-only reference is dropped when a line-ranged reference to the
+    /// same file exists -- the precise one is what the answer rests on.
     pub async fn sources(&self) -> Vec<SourceReference> {
-        self.state.lock().await.sources.clone()
+        orbit_agent::dedupe_sources(self.state.lock().await.sources.clone())
     }
 
     /// Replace the active project set.
@@ -603,6 +616,7 @@ impl SessionRuntime {
                 .await;
                 let confidence = retrieved.confidence();
                 let scope = retrieved.scope.clone();
+                let declared_symbols = retrieved.declared_symbols;
                 let retrieved_sources = retrieved.sources;
                 let retrieved_records = retrieved.records;
 
@@ -638,7 +652,7 @@ impl SessionRuntime {
                     return Ok(TurnOutcome {
                         turn_id: _turn_id.clone(),
                         answer: String::new(),
-                        sources: retrieved_sources,
+                        sources: orbit_agent::dedupe_sources(retrieved_sources),
                         cancelled: true,
                         active_projects: state.active_projects.clone(),
                         used_default_project: scope.used_default,
@@ -656,7 +670,8 @@ impl SessionRuntime {
                 .with_streaming(self.streaming)
                 // Workspace retrieval already ran above; the agent's own
                 // single-project retrieval would only fail here.
-                .with_builtin_retrieval(false);
+                .with_builtin_retrieval(false)
+                .with_declared_symbols(declared_symbols);
 
                 let mut outcome = agent
                     .continue_from_history(&mut state.history, text)
@@ -690,7 +705,7 @@ impl SessionRuntime {
         Ok(TurnOutcome {
             turn_id: _turn_id.clone(),
             answer: outcome.answer,
-            sources: outcome.sources,
+            sources: orbit_agent::dedupe_sources(outcome.sources),
             cancelled: outcome.cancelled,
             active_projects,
             used_default_project: used_default,

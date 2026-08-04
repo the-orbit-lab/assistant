@@ -97,6 +97,47 @@ fn write_session_project(root: &Path) {
     }
     std::fs::write(project.join("tests/grounding.rs"), &grounding).unwrap();
 
+    // A cancellation mechanism spread across three call sites, which is
+    // what a behavior question has to find.
+    std::fs::write(
+        project.join("src/agent.rs"),
+        "//! The tool-calling loop.\n\
+         \n\
+         pub struct Agent {\n\
+         \x20   cancel: CancellationToken,\n\
+         }\n\
+         \n\
+         impl Agent {\n\
+         \x20   /// Run one turn.\n\
+         \x20   pub async fn run(&self) -> Result<Outcome, OrbitError> {\n\
+         \x20       if self.cancel.is_cancelled() {\n\
+         \x20           return Ok(self.cancelled_outcome());\n\
+         \x20       }\n\
+         \x20       loop {\n\
+         \x20           let response = self.provider.chat_streaming().await?;\n\
+         \x20           if self.cancel.is_cancelled() {\n\
+         \x20               return Ok(self.cancelled_outcome());\n\
+         \x20           }\n\
+         \x20           for call in response.tool_calls {\n\
+         \x20               if self.cancel.is_cancelled() {\n\
+         \x20                   return Ok(self.cancelled_outcome());\n\
+         \x20               }\n\
+         \x20               self.execute(call).await;\n\
+         \x20           }\n\
+         \x20       }\n\
+         \x20   }\n\
+         \n\
+         \x20   /// Release every pending permission wait and keep the work\n\
+         \x20   /// already completed.\n\
+         \x20   fn cancelled_outcome(&self) -> Outcome {\n\
+         \x20       self.pending.release_all();\n\
+         \x20       self.events.emit(EventPayload::ExecutionCancelled {});\n\
+         \x20       Outcome { sources: self.sources.clone(), cancelled: true }\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+
     std::fs::create_dir_all(project.join("docs")).unwrap();
     std::fs::write(
         project.join("docs/SESSIONS.md"),
@@ -298,4 +339,216 @@ async fn a_question_without_a_symbol_still_retrieves() {
     let requests = provider.recorded_requests();
     let paths = context_paths(&requests[0]);
     assert!(!paths.is_empty(), "no evidence retrieved at all");
+}
+
+// ---------------------------------------------------------------------
+// Behavior questions
+// ---------------------------------------------------------------------
+
+async fn run_question(question: &str) -> (tempfile::TempDir, Vec<String>, Vec<ModelRequest>) {
+    let (tmp, runtime, provider) = session_workspace();
+    runtime
+        .set_active_projects(&["assistant".to_string()])
+        .await
+        .unwrap();
+    runtime.send_message(question).await.unwrap();
+    let requests = provider.recorded_requests();
+    let paths = context_paths(&requests[0]);
+    (tmp, paths, requests)
+}
+
+/// Everything the provider was shown, as one string.
+fn transcript(request: &ModelRequest) -> String {
+    request
+        .messages
+        .iter()
+        .map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A behavior question names no type, so nothing declares it. Its answer
+/// is the code that performs the behavior, and that code must arrive.
+#[tokio::test]
+async fn a_behavior_question_retrieves_implementation() {
+    let (_tmp, paths, _) =
+        run_question("How is cancellation checked during model streaming and tool execution?")
+            .await;
+    assert!(
+        paths.iter().any(|p| p.ends_with("src/agent.rs")),
+        "the implementing file never reached the provider: {paths:?}"
+    );
+}
+
+/// The check performed before and during a model request.
+#[tokio::test]
+async fn cancellation_during_streaming_reaches_the_provider() {
+    let (_tmp, _, requests) =
+        run_question("How is cancellation checked during model streaming and tool execution?")
+            .await;
+    let text = transcript(&requests[0]);
+    assert!(
+        text.contains("chat_streaming"),
+        "streaming call site missing"
+    );
+    assert!(
+        text.contains("if self.cancel.is_cancelled()"),
+        "no cancellation check reached the model"
+    );
+}
+
+/// The check performed between tool calls.
+#[tokio::test]
+async fn cancellation_between_tool_calls_reaches_the_provider() {
+    let (_tmp, _, requests) =
+        run_question("How is cancellation checked during model streaming and tool execution?")
+            .await;
+    let text = transcript(&requests[0]);
+    assert!(
+        text.contains("for call in response.tool_calls"),
+        "the tool-call loop never reached the model"
+    );
+}
+
+/// Pending permission release and the event emitted.
+#[tokio::test]
+async fn pending_permission_release_reaches_the_provider() {
+    let (_tmp, _, requests) = run_question(
+        "What happens to pending permissions and completed work when a turn is cancelled?",
+    )
+    .await;
+    let text = transcript(&requests[0]);
+    assert!(text.contains("release_all"), "permission release missing");
+    assert!(
+        text.contains("ExecutionCancelled"),
+        "the cancellation event never reached the model"
+    );
+}
+
+/// Work that finished before the stop is kept, and the evidence has to
+/// show it rather than leaving the model to assume either way.
+#[tokio::test]
+async fn completed_work_preservation_reaches_the_provider() {
+    let (_tmp, _, requests) = run_question(
+        "What happens to pending permissions and completed work when a turn is cancelled?",
+    )
+    .await;
+    let text = transcript(&requests[0]);
+    assert!(
+        text.contains("sources: self.sources.clone()"),
+        "completed-work preservation never reached the model"
+    );
+}
+
+/// A behavior question must be told to answer from the quoted code, and
+/// told which code that is.
+#[tokio::test]
+async fn a_behavior_question_carries_a_grounding_anchor() {
+    let (_tmp, _, requests) =
+        run_question("How is cancellation checked during model streaming and tool execution?")
+            .await;
+    let anchored = requests[0].messages.iter().any(|m| {
+        m.role == Role::System
+            && m.content.contains("about behavior")
+            && m.content.contains("must appear in the quoted evidence")
+    });
+    assert!(anchored, "no behavior anchor reached the provider");
+}
+
+/// A session revisits the same files across turns and every turn records
+/// sources twice by design. `/sources` must not repeat them.
+#[tokio::test]
+async fn session_sources_are_deduplicated() {
+    let (_tmp, runtime, _) = session_workspace();
+    runtime
+        .set_active_projects(&["assistant".to_string()])
+        .await
+        .unwrap();
+    runtime
+        .send_message("Explain SessionRuntime and how it stores session state.")
+        .await
+        .unwrap();
+
+    let sources = runtime.sources().await;
+    let mut seen = sources.clone();
+    seen.sort_by_key(|s| (s.path.clone(), s.line_start, s.line_end, s.section.clone()));
+    seen.dedup_by_key(|s| (s.path.clone(), s.line_start, s.line_end, s.section.clone()));
+    assert_eq!(
+        seen.len(),
+        sources.len(),
+        "/sources repeated identical references: {sources:?}"
+    );
+
+    // And a whole-file reference is dropped when precise lines of the
+    // same file are present.
+    for source in &sources {
+        if source.line_start.is_none() {
+            assert!(
+                !sources
+                    .iter()
+                    .any(|other| other.path == source.path && other.line_start.is_some()),
+                "a path-only reference survived alongside line-ranged ones: {sources:?}"
+            );
+        }
+    }
+}
+
+/// The reported hallucination: an answer that invents `start_session()`
+/// and `handle_request()` on a type that has neither must not present
+/// them as this repository's API.
+#[tokio::test]
+async fn invented_method_names_are_flagged_in_the_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".orbit")).unwrap();
+    write_session_project(&root);
+
+    let yaml = "version: 1\n\
+        workspace:\n  name: Orbit Lab\n  description: grounding fixture\n\
+        projects:\n\
+        \x20\x20assistant:\n    path: ./assistant\n";
+    let config_path = root.join(".orbit/workspace.yaml");
+    std::fs::write(&config_path, yaml).unwrap();
+    let config = WorkspaceConfig::parse(yaml).unwrap();
+    let projects = Arc::new(ProjectRegistry::load(root.clone(), config_path, config).unwrap());
+
+    let provider = Arc::new(MockProvider::new(vec![answer(
+        "SessionRuntime exposes `start_session()` and `handle_request()`, and stores \
+         `record_state` results.",
+    )]));
+    let runtime = SessionRuntime::workspace(
+        projects,
+        provider.clone(),
+        Arc::new(CollectingSink::new()),
+        ConfirmationMode::AutoAllow,
+        false,
+    )
+    .unwrap();
+
+    runtime
+        .set_active_projects(&["assistant".to_string()])
+        .await
+        .unwrap();
+    let outcome = runtime
+        .send_message("Explain SessionRuntime and how it stores session state.")
+        .await
+        .unwrap();
+
+    assert!(
+        outcome.answer.contains("Not found in this repository"),
+        "invented names were presented as fact: {}",
+        outcome.answer
+    );
+    assert!(outcome.answer.contains("start_session"));
+    assert!(outcome.answer.contains("handle_request"));
+    // A method the project really declares must not be flagged.
+    let notice = outcome
+        .answer
+        .split("Not found in this repository")
+        .nth(1)
+        .unwrap_or("");
+    assert!(
+        !notice.contains("record_state"),
+        "a real method was flagged as invented: {notice}"
+    );
 }
